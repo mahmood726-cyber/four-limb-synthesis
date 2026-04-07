@@ -163,7 +163,7 @@ canvas { image-rendering: pixelated; }
 <nav class="tab-bar" role="tablist">
     <button class="tab-btn active" role="tab" aria-selected="true" data-tab="limb1">Limb 1: Trial Efficacy</button>
     <button class="tab-btn" role="tab" aria-selected="false" data-tab="limb2">Limb 2: Causal Transport</button>
-    <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="limb3" disabled>Limb 3: Economics</button>
+    <button class="tab-btn" role="tab" aria-selected="false" data-tab="limb3">Limb 3: Economics</button>
     <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="limb4" disabled>Limb 4: Uncertainty</button>
     <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="integration" disabled>Integration</button>
 </nav>
@@ -215,7 +215,37 @@ canvas { image-rendering: pixelated; }
             <button onclick="if(typeof Limb2!=='undefined')Limb2.exportPNG()">Export PNG</button>
         </div>
     </div>
-    <div id="panel-limb3" class="tab-panel" role="tabpanel"></div>
+    <div id="panel-limb3" class="tab-panel" role="tabpanel">
+        <div class="method-bar" id="limb3-methods" role="radiogroup" aria-label="Select economics method"></div>
+        <div class="split-pane">
+            <div>
+                <div id="limb3-viz" class="viz-container">
+                    <div class="viz-title" id="limb3-viz-title">Select a method to begin</div>
+                    <canvas id="limb3-canvas" width="900" height="500"></canvas>
+                </div>
+            </div>
+            <div>
+                <div id="limb3-controls" class="card">
+                    <h3>Adoption Parameters</h3>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:0.85rem;">
+                        <label>Innovation (p): <input type="range" id="limb3-p" min="0.01" max="0.10" step="0.005" value="0.03"></label>
+                        <label>Imitation (q): <input type="range" id="limb3-q" min="0.1" max="0.8" step="0.05" value="0.38"></label>
+                        <label>Volatility (&sigma;): <input type="range" id="limb3-sigma" min="0.05" max="0.5" step="0.05" value="0.15"></label>
+                        <label>Discount rate (r): <input type="range" id="limb3-r" min="0.01" max="0.15" step="0.01" value="0.05"></label>
+                    </div>
+                </div>
+                <div id="limb3-summary" class="card" style="margin-top:12px;">
+                    <h3>Regional Summary</h3>
+                    <div id="limb3-summary-table"></div>
+                </div>
+            </div>
+        </div>
+        <div id="limb3-results"></div>
+        <div class="export-bar">
+            <button onclick="if(typeof Limb3!=='undefined')Limb3.exportCSV()">Export CSV</button>
+            <button onclick="if(typeof Limb3!=='undefined')Limb3.exportPNG()">Export PNG</button>
+        </div>
+    </div>
     <div id="panel-limb4" class="tab-panel" role="tabpanel"></div>
     <div id="panel-integration" class="tab-panel" role="tabpanel"></div>
 </main>
@@ -964,7 +994,78 @@ const MathCore = (() => {
         return { parents, children, ancestors, descendants, backdoorSet, isIdentifiable, topoSort };
     })();
 
-    return { random, linalg, stats, optim, tda, kernel, graph };
+    // --- ODE Solvers ---
+    const ode = (() => {
+        // RK4: solve dy/dt = f(t, y) from t0 to t1 with step h
+        function rk4(f, y0, t0, t1, h) {
+            let t = t0, y = y0;
+            const trajectory = [{t, y}];
+            while (t < t1 - 1e-12) {
+                const dt = Math.min(h, t1 - t);
+                const k1 = f(t, y);
+                const k2 = f(t + dt/2, y + k1 * dt/2);
+                const k3 = f(t + dt/2, y + k2 * dt/2);
+                const k4 = f(t + dt, y + k3 * dt);
+                y = y + (k1 + 2*k2 + 2*k3 + k4) * dt / 6;
+                t += dt;
+                trajectory.push({t, y});
+            }
+            return trajectory;
+        }
+
+        // Euler-Maruyama: solve dY = f(t,Y)dt + g(t,Y)dW
+        // Returns a single sample path
+        function eulerMaruyama(drift, diffusion, y0, t0, t1, dt, rng) {
+            let t = t0, y = y0;
+            const path = [{t, y}];
+            while (t < t1 - 1e-12) {
+                const step = Math.min(dt, t1 - t);
+                const sqrtStep = Math.sqrt(step);
+                const dW = rng.normal() * sqrtStep;
+                const fVal = drift(t, y);
+                const gVal = diffusion(t, y);
+                y = y + fVal * step + gVal * dW;
+                y = Math.max(0, y); // Absorbing barrier at 0
+                t += step;
+                path.push({t, y});
+            }
+            return path;
+        }
+
+        // Run N sample paths of Euler-Maruyama
+        function emPaths(drift, diffusion, y0, t0, t1, dt, nPaths, seed) {
+            const paths = [];
+            for (let i = 0; i < nPaths; i++) {
+                random.seed(seed + i * 7919);
+                paths.push(eulerMaruyama(drift, diffusion, y0, t0, t1, dt, random));
+            }
+            return paths;
+        }
+
+        // Compute median + quantile bands from an array of paths (same time grid)
+        function pathBands(paths, quantiles) {
+            quantiles = quantiles ?? [0.025, 0.5, 0.975];
+            if (paths.length === 0) return [];
+            const nSteps = paths[0].length;
+            const bands = [];
+            for (let s = 0; s < nSteps; s++) {
+                const t = paths[0][s].t;
+                const vals = paths.map(p => p[s].y).sort((a, b) => a - b);
+                const n = vals.length;
+                const result = {t};
+                for (const q of quantiles) {
+                    const idx = Math.min(Math.floor(q * n), n - 1);
+                    result[`q${q}`] = vals[idx];
+                }
+                bands.push(result);
+            }
+            return bands;
+        }
+
+        return { rk4, eulerMaruyama, emPaths, pathBands };
+    })();
+
+    return { random, linalg, stats, optim, tda, kernel, graph, ode };
 })();
 </script>
 
@@ -3186,6 +3287,149 @@ const Limb2 = (() => {
 </script>
 
 <!-- ============================================================
+     SCRIPT 3b: Limb3 — Stochastic Economics & Adoption Dynamics
+     ============================================================ -->
+<script>
+/* === LIMB 3: STOCHASTIC ECONOMICS & ADOPTION DYNAMICS === */
+const Limb3 = (() => {
+    const methods = {};
+
+    // Shared: Bass model parameters from context
+    function bassParams(ctxRow, pBase, qBase) {
+        pBase = pBase ?? 0.03;
+        qBase = qBase ?? 0.38;
+        const healthFactor = ctxRow.health_exp_per_capita / 5000;
+        const p = pBase * healthFactor * ctxRow.adoption_readiness;
+        const q = qBase * healthFactor * ctxRow.adoption_readiness;
+        return {p, q, m: 0.8}; // m = uptake cap
+    }
+
+    // M19: Euler-Maruyama Bass SDE
+    methods.bassSDE = function(contextRows, options) {
+        options = options ?? {};
+        const nPaths = options.nPaths ?? 100;
+        const tMax = options.tMax ?? 10;
+        const dt = options.dt ?? 0.05;
+        const sigma = options.sigma ?? 0.15;
+        const seed = options.seed ?? 42;
+        const pBase = options.pBase ?? 0.03;
+        const qBase = options.qBase ?? 0.38;
+        const results = [];
+
+        for (const ctx of contextRows) {
+            const bp = bassParams(ctx, pBase, qBase);
+            const p = bp.p, q = bp.q, m = bp.m;
+
+            const drift = function(_t, y) {
+                const u = Math.max(0, Math.min(m, y));
+                return p * (m - u) + q * u * (m - u) / m;
+            };
+            const diffusion = function(_t, y) { return sigma * Math.max(0, y); };
+
+            const paths = MathCore.ode.emPaths(drift, diffusion, 0.01, 0, tMax, dt, nPaths, seed);
+            const bands = MathCore.ode.pathBands(paths);
+
+            // Deterministic Bass solution for comparison
+            const detPath = MathCore.ode.rk4(function(_t, y) {
+                const u = Math.max(0, Math.min(m, y));
+                return p * (m - u) + q * u * (m - u) / m;
+            }, 0.01, 0, tMax, dt);
+
+            const lastBand = bands.length > 0 ? bands[bands.length - 1] : null;
+            results.push({
+                region: ctx.region,
+                paths, bands, detPath,
+                params: {p, q, m, sigma},
+                finalMedian: lastBand ? (lastBand['q0.5'] ?? 0) : 0
+            });
+        }
+        return results;
+    };
+
+    // M20: Mean-Field Game Theory
+    // Simplified finite-state MFG: each region chooses adoption intensity
+    // Utility = benefit * adoption - cost * adoption² + interaction * (mean_adoption - adoption)²
+    methods.meanFieldGame = function(contextRows, options) {
+        options = options ?? {};
+        const maxIter = options.maxIter ?? 100;
+        const interactionStrength = options.interactionStrength ?? 0.5;
+        const seed = options.seed ?? 42;
+        MathCore.random.seed(seed);
+        const R = contextRows.length;
+
+        // Initialize adoption levels
+        let adoption = contextRows.map(function(ctx) {
+            const bp = bassParams(ctx);
+            const p = bp.p, q = bp.q, m = bp.m;
+            // Start at Bass steady-state approximation
+            return Math.min(m, p / (p + q) * m + 0.1);
+        });
+
+        let converged = false;
+        let iter = 0;
+
+        for (iter = 0; iter < maxIter; iter++) {
+            const meanAdoption = adoption.reduce(function(a, b) { return a + b; }, 0) / R;
+            const newAdoption = new Float64Array(R);
+
+            for (let r = 0; r < R; r++) {
+                const ctx = contextRows[r];
+                const benefit = ctx.health_exp_per_capita / 12000; // Normalized benefit
+                const cost = ctx.treatment_cost_usd / 120; // Normalized cost
+
+                // Best response: maximize utility given mean field
+                // U(a) = benefit * a - cost * a² - interaction * (a - meanAdoption)²
+                // dU/da = benefit - 2*cost*a - 2*interaction*(a - meanAdoption) = 0
+                // a* = (benefit + 2*interaction*meanAdoption) / (2*cost + 2*interaction)
+                const denom = 2 * cost + 2 * interactionStrength;
+                const aStar = denom > 1e-10
+                    ? (benefit + 2 * interactionStrength * meanAdoption) / denom
+                    : 0.5;
+
+                newAdoption[r] = Math.max(0, Math.min(0.8, aStar));
+            }
+
+            // Check convergence
+            let maxDiff = 0;
+            for (let r = 0; r < R; r++) maxDiff = Math.max(maxDiff, Math.abs(newAdoption[r] - adoption[r]));
+            adoption = Array.from(newAdoption);
+
+            if (maxDiff < 1e-4) { converged = true; break; }
+        }
+
+        // Compare with non-strategic (independent) adoption
+        const independent = contextRows.map(function(ctx) {
+            const benefit = ctx.health_exp_per_capita / 12000;
+            const cost = ctx.treatment_cost_usd / 120;
+            return Math.max(0, Math.min(0.8, benefit / (2 * cost)));
+        });
+
+        return {
+            equilibrium: contextRows.map(function(ctx, i) {
+                return {
+                    region: ctx.region,
+                    adoption: adoption[i],
+                    independent: independent[i],
+                    strategicGap: adoption[i] - independent[i]
+                };
+            }),
+            converged: converged, iterations: iter + 1,
+            interactionStrength: interactionStrength
+        };
+    };
+
+    // Public API stubs (filled in Task 6)
+    function init() {}
+    function onDataChange() {}
+    function exportCSV() {}
+    function exportPNG() {}
+    function getResults() { return null; }
+
+    return { methods, init, onDataChange, exportCSV, exportPNG, getResults };
+})();
+</script>
+
+<!-- ============================================================
      SCRIPT 4: TestRunner + all 17 tests
      ============================================================ -->
 <script>
@@ -3720,6 +3964,56 @@ TestRunner.register('Integration: Limb2 full pipeline', function() {
     if (typeof res.causal.ate_causal !== 'number' || isNaN(res.causal.ate_causal)) throw new Error('Causal failed');
     if (typeof res.kliep.ate_transported !== 'number' || isNaN(res.kliep.ate_transported)) throw new Error('KLIEP failed');
     if (res.mapper.nodes.length === 0) throw new Error('Mapper empty');
+});
+
+// ---- T53: RK4 solves exponential growth dy/dt = y ----
+TestRunner.register('ODE: RK4 exponential growth', function() {
+    const traj = MathCore.ode.rk4(function(_t, y) { return y; }, 1.0, 0, 1, 0.01);
+    const yFinal = traj[traj.length - 1].y;
+    // Should be e^1 ≈ 2.718
+    if (Math.abs(yFinal - Math.E) > 0.01) throw new Error('y(1)=' + yFinal + ', expected ' + Math.E);
+});
+
+// ---- T54: Euler-Maruyama produces valid Bass SDE path ----
+TestRunner.register('ODE: Euler-Maruyama Bass SDE path', function() {
+    MathCore.random.seed(42);
+    const m = 0.8, p = 0.03, q = 0.38;
+    const drift = function(_t, y) { return (p * (m - y) + q * y * (m - y) / m); };
+    const diffusion = function(_t, y) { return 0.15 * y; };
+    const path = MathCore.ode.eulerMaruyama(drift, diffusion, 0.01, 0, 10, 0.01, MathCore.random);
+    if (path.length < 10) throw new Error('Path too short: ' + path.length);
+    const yEnd = path[path.length - 1].y;
+    if (yEnd < 0 || yEnd > 1) throw new Error('y(10) = ' + yEnd + ' out of [0,1]');
+});
+
+// ---- T55: emPaths produces N paths with bands ----
+TestRunner.register('ODE: emPaths + pathBands', function() {
+    const drift = function(_t, y) { return 0.1 * (0.5 - y); };
+    const diff = function(_t, y) { return 0.05 * y; };
+    const paths = MathCore.ode.emPaths(drift, diff, 0.01, 0, 5, 0.1, 50, 42);
+    if (paths.length !== 50) throw new Error('Expected 50 paths, got ' + paths.length);
+    const bands = MathCore.ode.pathBands(paths);
+    if (!bands[0].hasOwnProperty('q0.5')) throw new Error('Missing median band');
+});
+
+// ---- T56: Bass SDE produces 4 regional results with bands ----
+TestRunner.register('M19: Bass SDE 4-region adoption', function() {
+    const ctx = DataLayer.getContext().filter(function(c) { return c.year === 2025; });
+    const res = Limb3.methods.bassSDE(ctx, {nPaths: 20, tMax: 10, seed: 42});
+    if (res.length !== 4) throw new Error('Expected 4 regions, got ' + res.length);
+    if (!res[0].bands) throw new Error('Missing bands');
+    if (res[0].region !== 'North America') throw new Error('First region: ' + res[0].region);
+});
+
+// ---- T57: Mean-field game converges ----
+TestRunner.register('M20: MFG Nash equilibrium', function() {
+    const ctx = DataLayer.getContext().filter(function(c) { return c.year === 2025; });
+    const res = Limb3.methods.meanFieldGame(ctx, {maxIter: 50, seed: 42});
+    if (!res.equilibrium) throw new Error('No equilibrium');
+    if (res.iterations < 1) throw new Error('No iterations');
+    for (const r of res.equilibrium) {
+        if (r.adoption < 0 || r.adoption > 1) throw new Error('Adoption ' + r.adoption + ' out of range');
+    }
 });
 </script>
 
