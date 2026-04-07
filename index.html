@@ -1208,6 +1208,7 @@ const App = (() => {
 
         // Initialize Limb1 visualization
         Limb1.init();
+        if (typeof Limb2 !== 'undefined') Limb2.init();
     }
 
     function updateStatus(msg) {
@@ -1709,6 +1710,7 @@ const Limb1 = (() => {
     function render() {
         if (!currentResults) return;
         const canvas = document.getElementById('limb1-canvas');
+        if (!canvas || typeof canvas.getContext !== 'function') return;
         const ctx = canvas.getContext('2d');
         const W = canvas.width, H = canvas.height;
         ctx.clearRect(0, 0, W, H);
@@ -2688,12 +2690,496 @@ const Limb2 = (() => {
         return { nodes: nodes, edges: edges };
     };
 
-    // Public API stubs
-    function init() {}
-    function onDataChange() {}
-    function exportCSV() {}
-    function exportPNG() {}
-    function getResults() { return null; }
+    // ---- Visualization + DAG Editor ----
+
+    const METHOD_LIST = [
+        {id: 'distribution', label: 'Distribution Overlay'},
+        {id: 'ipsw',         label: 'IPSW'},
+        {id: 'aipw',         label: 'AIPW'},
+        {id: 'sinkhorn',     label: 'Optimal Transport'},
+        {id: 'mmd',          label: 'MMD Test'},
+        {id: 'causal',       label: 'Causal DAG'},
+        {id: 'knockoff',     label: 'Knockoff Filter'},
+        {id: 'kliep',        label: 'KLIEP'},
+        {id: 'mapper',       label: 'Mapper TDA'},
+    ];
+
+    let activeMethod = 'distribution';
+    let currentResults = null;
+    let dagState = {
+        nodes: ['age_65', 'diabetes', 'treatment', 'outcome'],
+        edges: [
+            {from:'age_65',  to:'treatment'}, {from:'age_65',  to:'outcome'},
+            {from:'diabetes',to:'treatment'}, {from:'diabetes',to:'outcome'},
+            {from:'treatment',to:'outcome'}
+        ]
+    };
+
+    function resetDAG() {
+        dagState = {
+            nodes: ['age_65', 'diabetes', 'treatment', 'outcome'],
+            edges: [
+                {from:'age_65',  to:'treatment'}, {from:'age_65',  to:'outcome'},
+                {from:'diabetes',to:'treatment'}, {from:'diabetes',to:'outcome'},
+                {from:'treatment',to:'outcome'}
+            ]
+        };
+    }
+
+    function init() {
+        const bar = document.getElementById('limb2-methods');
+        if (!bar) return;
+        bar.innerHTML = '';
+        for (const m of METHOD_LIST) {
+            const btn = document.createElement('button');
+            btn.className = 'method-btn' + (m.id === activeMethod ? ' active' : '');
+            btn.textContent = m.label;
+            btn.setAttribute('role', 'radio');
+            btn.addEventListener('click', function() {
+                activeMethod = m.id;
+                bar.querySelectorAll('.method-btn').forEach(function(b) { b.classList.remove('active'); });
+                btn.classList.add('active');
+                render();
+            });
+            bar.appendChild(btn);
+        }
+
+        // DAG editor buttons
+        const dagDefault = document.getElementById('dag-default');
+        if (dagDefault) dagDefault.addEventListener('click', function() { resetDAG(); render(); });
+        const dagClear = document.getElementById('dag-clear');
+        if (dagClear) dagClear.addEventListener('click', function() {
+            dagState = {nodes: [], edges: []};
+            render();
+        });
+
+        onDataChange();
+    }
+
+    function onDataChange() {
+        const limb1Results = typeof Limb1 !== 'undefined' ? Limb1.getResults() : null;
+        if (!limb1Results) return;
+
+        const ctx = DataLayer.getContextByRegion('North America', 2025);
+        const pooledYi = limb1Results.reml.mu;
+        const ipd = DataLayer.generateTransportIPD({yi: pooledYi}, ctx, 200, 200, 42);
+
+        const trialX  = ipd.trialIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+        const targetX = ipd.targetIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+
+        // Run all transport methods
+        const ipsw        = methods.ipsw(ipd.trialIPD, ipd.targetIPD);
+        const aipw        = methods.aipw(ipd.trialIPD, ipd.targetIPD);
+        const sinkhorn    = methods.sinkhornTransport(ipd.trialIPD, ipd.targetIPD, 0.1);
+        const mmd         = methods.mmdTest(trialX, targetX, 100);
+        const causal      = methods.causalTransport(ipd.trialIPD, ipd.targetIPD, dagState);
+        const knockoff    = methods.knockoffFilter(ipd.trialIPD, 0.2);
+        const kliep       = methods.kliepTransport(ipd.trialIPD, ipd.targetIPD);
+        const mapperResult= methods.mapper(trialX.concat(targetX), {nIntervals: 8, overlap: 0.3});
+
+        currentResults = {
+            ipsw, aipw, sinkhorn, mmd, causal, knockoff, kliep, mapper: mapperResult,
+            ipd, trialX, targetX, pooledYi, ctx
+        };
+
+        render();
+    }
+
+    function render() {
+        if (!currentResults) return;
+        const canvas = document.getElementById('limb2-canvas');
+        if (!canvas) return;
+        const ctx2d = (typeof canvas.getContext === 'function') ? canvas.getContext('2d') : null;
+        const W = canvas.width || 900, H = canvas.height || 500;
+        if (ctx2d) ctx2d.clearRect(0, 0, W, H);
+
+        const title = document.getElementById('limb2-viz-title');
+
+        switch (activeMethod) {
+            case 'distribution':
+                if (title) title.textContent = 'Covariate Distribution: Trial vs Target';
+                drawDistribution(ctx2d, W, H);
+                break;
+            case 'ipsw': case 'aipw':
+                if (title) title.textContent = activeMethod === 'ipsw' ? 'IPSW Propensity Weights' : 'AIPW Components';
+                drawWeights(ctx2d, W, H);
+                break;
+            case 'sinkhorn':
+                if (title) title.textContent = 'Optimal Transport Map (Sinkhorn)';
+                drawTransportMap(ctx2d, W, H);
+                break;
+            case 'mmd':
+                if (title) title.textContent = 'MMD Two-Sample Test (p=' + currentResults.mmd.pValue.toFixed(3) + ')';
+                drawDistribution(ctx2d, W, H);
+                break;
+            case 'causal':
+                if (title) title.textContent = 'Causal Transport via Do-Calculus';
+                drawDAG();
+                break;
+            case 'knockoff':
+                if (title) title.textContent = 'Knockoff Filter \u2014 Variable Importance';
+                drawKnockoff(ctx2d, W, H);
+                break;
+            case 'kliep':
+                if (title) title.textContent = 'KLIEP Density Ratio Weights';
+                drawKLIEP(ctx2d, W, H);
+                break;
+            case 'mapper':
+                if (title) title.textContent = 'Mapper Complex (TDA)';
+                drawMapper(ctx2d, W, H);
+                break;
+        }
+
+        updateComparisonTable();
+        updateResultsTable();
+    }
+
+    function drawDistribution(ctx2d, W, H) {
+        if (!ctx2d) return;
+        const trialX = currentResults.trialX;
+        const targetX = currentResults.targetX;
+        const margin = {top: 30, right: 30, bottom: 50, left: 60};
+        const pW = W - margin.left - margin.right;
+        const pH = H - margin.top - margin.bottom;
+
+        const trialPropAge  = trialX.filter(function(r)  { return r[0] === 1; }).length / trialX.length;
+        const targetPropAge = targetX.filter(function(r) { return r[0] === 1; }).length / targetX.length;
+        const trialPropDiab  = trialX.filter(function(r)  { return r[1] === 1; }).length / trialX.length;
+        const targetPropDiab = targetX.filter(function(r) { return r[1] === 1; }).length / targetX.length;
+
+        const barW = pW / 6;
+        const maxP = Math.max(trialPropAge, targetPropAge, trialPropDiab, targetPropDiab, 0.3);
+
+        function yScale(v) { return margin.top + (1 - v / maxP) * pH; }
+
+        // Age 65+ bars
+        ctx2d.fillStyle = '#4e8cff'; ctx2d.globalAlpha = 0.7;
+        ctx2d.fillRect(margin.left + barW * 0.5, yScale(trialPropAge),  barW, pH - (yScale(trialPropAge)  - margin.top));
+        ctx2d.fillStyle = '#fb923c';
+        ctx2d.fillRect(margin.left + barW * 1.8, yScale(targetPropAge), barW, pH - (yScale(targetPropAge) - margin.top));
+
+        // Diabetes bars
+        ctx2d.fillStyle = '#4e8cff';
+        ctx2d.fillRect(margin.left + barW * 3.5, yScale(trialPropDiab),  barW, pH - (yScale(trialPropDiab)  - margin.top));
+        ctx2d.fillStyle = '#fb923c';
+        ctx2d.fillRect(margin.left + barW * 4.8, yScale(targetPropDiab), barW, pH - (yScale(targetPropDiab) - margin.top));
+        ctx2d.globalAlpha = 1;
+
+        // Labels
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '12px sans-serif'; ctx2d.textAlign = 'center';
+        ctx2d.fillText('Age 65+',  margin.left + barW * 1.3, H - 10);
+        ctx2d.fillText('Diabetes', margin.left + barW * 4.3, H - 10);
+
+        // Legend
+        ctx2d.fillStyle = '#4e8cff'; ctx2d.fillRect(W - 160, 10, 12, 12);
+        ctx2d.fillStyle = '#fb923c'; ctx2d.fillRect(W - 160, 28, 12, 12);
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.textAlign = 'left'; ctx2d.font = '11px sans-serif';
+        ctx2d.fillText('Trial',  W - 144, 21);
+        ctx2d.fillText('Target', W - 144, 39);
+    }
+
+    function drawWeights(ctx2d, W, H) {
+        if (!ctx2d) return;
+        const weights = activeMethod === 'ipsw' ? currentResults.ipsw.weights : null;
+        if (!weights) { drawDistribution(ctx2d, W, H); return; }
+
+        const margin = {top: 30, right: 30, bottom: 50, left: 60};
+        const pW = W - margin.left - margin.right;
+        const pH = H - margin.top - margin.bottom;
+
+        const maxW = Math.max.apply(null, weights);
+        const n = weights.length;
+
+        ctx2d.fillStyle = '#4e8cff';
+        for (let i = 0; i < n; i++) {
+            const x = margin.left + (i / n) * pW;
+            const barH = (weights[i] / maxW) * pH;
+            ctx2d.fillRect(x, margin.top + pH - barH, Math.max(1, pW / n - 1), barH);
+        }
+
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '12px sans-serif'; ctx2d.textAlign = 'center';
+        ctx2d.fillText('Observation Index', W / 2, H - 10);
+        ctx2d.save(); ctx2d.translate(15, H / 2); ctx2d.rotate(-Math.PI / 2);
+        ctx2d.fillText('IPSW Weight', 0, 0); ctx2d.restore();
+    }
+
+    function drawTransportMap(ctx2d, W, H) {
+        if (!ctx2d) return;
+        const trialX  = currentResults.trialX;
+        const targetX = currentResults.targetX;
+        const sinkhorn = currentResults.sinkhorn;
+        const margin = {top: 30, right: 30, bottom: 50, left: 60};
+        const pW = W - margin.left - margin.right;
+        const pH = H - margin.top - margin.bottom;
+
+        // Jitter binary covariates for visibility
+        MathCore.random.seed(99);
+        function jitter() { return MathCore.random.uniform() * 0.4 - 0.2; }
+
+        // Trial points (blue, top half)
+        ctx2d.fillStyle = '#4e8cff'; ctx2d.globalAlpha = 0.5;
+        var trialPx = trialX.map(function(r) {
+            return [
+                margin.left + (r[0] * 0.7 + 0.15 + jitter() * 0.1) * pW,
+                margin.top  + (0.2 + jitter() * 0.1) * pH
+            ];
+        });
+        for (var i = 0; i < trialPx.length; i++) {
+            ctx2d.beginPath(); ctx2d.arc(trialPx[i][0], trialPx[i][1], 3, 0, 2 * Math.PI); ctx2d.fill();
+        }
+
+        // Target points (orange, bottom half)
+        ctx2d.fillStyle = '#fb923c';
+        var targetPx = targetX.map(function(r) {
+            return [
+                margin.left + (r[0] * 0.7 + 0.15 + jitter() * 0.1) * pW,
+                margin.top  + (0.7 + jitter() * 0.1) * pH
+            ];
+        });
+        for (var j2 = 0; j2 < targetPx.length; j2++) {
+            ctx2d.beginPath(); ctx2d.arc(targetPx[j2][0], targetPx[j2][1], 3, 0, 2 * Math.PI); ctx2d.fill();
+        }
+        ctx2d.globalAlpha = 1;
+
+        // Top 100 transport connections (green lines)
+        var plan = sinkhorn.plan;
+        var m = trialX.length, n2 = targetX.length;
+        var planFlat = [];
+        for (var ii = 0; ii < m; ii++)
+            for (var jj = 0; jj < n2; jj++)
+                planFlat.push({i: ii, j: jj, w: plan[ii][jj]});
+        planFlat.sort(function(a, b) { return b.w - a.w; });
+
+        ctx2d.strokeStyle = '#34d399'; ctx2d.globalAlpha = 0.3; ctx2d.lineWidth = 0.5;
+        for (var k2 = 0; k2 < Math.min(100, planFlat.length); k2++) {
+            var pi = planFlat[k2].i, pj = planFlat[k2].j;
+            ctx2d.beginPath();
+            ctx2d.moveTo(trialPx[pi][0],  trialPx[pi][1]);
+            ctx2d.lineTo(targetPx[pj][0], targetPx[pj][1]);
+            ctx2d.stroke();
+        }
+        ctx2d.globalAlpha = 1;
+
+        ctx2d.fillStyle = '#8892a8'; ctx2d.font = '11px sans-serif'; ctx2d.textAlign = 'left';
+        ctx2d.fillText('W\u2082 = ' + sinkhorn.wasserstein.toFixed(4), margin.left + 10, margin.top + 20);
+
+        ctx2d.fillStyle = '#4e8cff'; ctx2d.fillRect(W - 120, 10, 10, 10);
+        ctx2d.fillStyle = '#fb923c'; ctx2d.fillRect(W - 120, 26, 10, 10);
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '10px sans-serif';
+        ctx2d.fillText('Trial',  W - 106, 19);
+        ctx2d.fillText('Target', W - 106, 35);
+    }
+
+    function drawDAG() {
+        var svg = document.getElementById('limb2-dag-svg');
+        if (!svg) return;
+
+        var positions = {
+            'age_65':    {x: 80,  y: 60},
+            'diabetes':  {x: 320, y: 60},
+            'treatment': {x: 200, y: 160},
+            'outcome':   {x: 200, y: 280}
+        };
+
+        var adjustSet = (currentResults && currentResults.causal && currentResults.causal.adjustmentSet)
+            ? new Set(currentResults.causal.adjustmentSet) : new Set();
+
+        var svgHTML = '<defs><marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto"><polygon points="0 0, 10 3.5, 0 7" fill="#8892a8"/></marker></defs>';
+
+        // Edges
+        for (var ei = 0; ei < dagState.edges.length; ei++) {
+            var e = dagState.edges[ei];
+            var from = positions[e.from], to = positions[e.to];
+            if (!from || !to) continue;
+            var dx = to.x - from.x, dy = to.y - from.y;
+            var len = Math.sqrt(dx * dx + dy * dy);
+            var nx = dx / len, ny = dy / len;
+            var x1 = from.x + nx * 25, y1 = from.y + ny * 25;
+            var x2 = to.x   - nx * 25, y2 = to.y   - ny * 25;
+            svgHTML += '<line x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '" stroke="#8892a8" stroke-width="2" marker-end="url(#arrowhead)"/>';
+        }
+
+        // Nodes
+        var nodeNames = Object.keys(positions);
+        for (var ni = 0; ni < nodeNames.length; ni++) {
+            var name = nodeNames[ni];
+            var pos  = positions[name];
+            var isAdj = adjustSet.has(name);
+            var fill   = name === 'treatment' ? '#4e8cff' : name === 'outcome' ? '#34d399' : isAdj ? '#fbbf24' : '#1a2340';
+            var stroke = isAdj ? '#fbbf24' : '#2a3555';
+            svgHTML += '<circle cx="' + pos.x + '" cy="' + pos.y + '" r="24" fill="' + fill + '" stroke="' + stroke + '" stroke-width="2"/>';
+            svgHTML += '<text x="' + pos.x + '" y="' + (pos.y + 4) + '" text-anchor="middle" fill="#e0e6f0" font-size="10" font-family="sans-serif">' + name + '</text>';
+        }
+
+        svg.innerHTML = svgHTML;
+    }
+
+    function drawKnockoff(ctx2d, W, H) {
+        if (!ctx2d) return;
+        var knockoff = currentResults.knockoff;
+        var margin = {top: 30, right: 30, bottom: 50, left: 120};
+        var pW = W - margin.left - margin.right;
+        var pH = H - margin.top - margin.bottom;
+
+        var maxImp = Math.max.apply(null, knockoff.importances.map(Math.abs).concat([0.01]));
+
+        for (var j = 0; j < knockoff.covariateNames.length; j++) {
+            var y  = margin.top + (j + 0.5) / knockoff.covariateNames.length * pH;
+            var w  = knockoff.importances[j];
+            var barLen = (w / maxImp) * pW * 0.8;
+            var isSelected = knockoff.selected.indexOf(knockoff.covariateNames[j]) !== -1;
+
+            ctx2d.fillStyle = isSelected ? '#34d399' : (w >= 0 ? '#4e8cff' : '#f87171');
+            if (w >= 0) {
+                ctx2d.fillRect(margin.left, y - 15, barLen, 30);
+            } else {
+                ctx2d.fillRect(margin.left + barLen, y - 15, -barLen, 30);
+            }
+
+            ctx2d.fillStyle = '#e0e6f0'; ctx2d.textAlign = 'right'; ctx2d.font = '12px sans-serif';
+            ctx2d.fillText(knockoff.covariateNames[j], margin.left - 10, y + 4);
+
+            ctx2d.textAlign = 'left';
+            ctx2d.fillText('W=' + w.toFixed(3) + (isSelected ? ' \u2713' : ''), margin.left + Math.abs(barLen) + 10, y + 4);
+        }
+
+        // FDR threshold line
+        if (knockoff.threshold !== null) {
+            var threshX = margin.left + (knockoff.threshold / maxImp) * pW * 0.8;
+            ctx2d.strokeStyle = '#f87171'; ctx2d.lineWidth = 2; ctx2d.setLineDash([5, 3]);
+            ctx2d.beginPath(); ctx2d.moveTo(threshX, margin.top); ctx2d.lineTo(threshX, H - margin.bottom);
+            ctx2d.stroke(); ctx2d.setLineDash([]);
+            ctx2d.fillStyle = '#f87171'; ctx2d.font = '10px sans-serif'; ctx2d.textAlign = 'left';
+            ctx2d.fillText('FDR threshold', threshX + 4, margin.top + 14);
+        }
+    }
+
+    function drawKLIEP(ctx2d, W, H) {
+        if (!ctx2d) return;
+        var ratios = currentResults.kliep.ratios;
+        var margin = {top: 30, right: 30, bottom: 50, left: 60};
+        var pW = W - margin.left - margin.right;
+        var pH = H - margin.top - margin.bottom;
+
+        var maxR = Math.max.apply(null, ratios);
+        var n = ratios.length;
+
+        for (var i = 0; i < n; i++) {
+            var x = margin.left + (i / n) * pW;
+            var barH = (ratios[i] / maxR) * pH;
+            var hue = ratios[i] > 1.2 ? 0 : (ratios[i] < 0.8 ? 220 : 150);
+            ctx2d.fillStyle = 'hsl(' + hue + ', 70%, 55%)';
+            ctx2d.fillRect(x, margin.top + pH - barH, Math.max(1, pW / n - 1), barH);
+        }
+
+        // Reference line at r=1
+        var refY = margin.top + pH - (1 / maxR) * pH;
+        ctx2d.strokeStyle = '#fbbf24'; ctx2d.lineWidth = 2; ctx2d.setLineDash([4, 2]);
+        ctx2d.beginPath(); ctx2d.moveTo(margin.left, refY); ctx2d.lineTo(W - margin.right, refY);
+        ctx2d.stroke(); ctx2d.setLineDash([]);
+
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '12px sans-serif'; ctx2d.textAlign = 'center';
+        ctx2d.fillText('Trial Observation', W / 2, H - 10);
+    }
+
+    function drawMapper(ctx2d, W, H) {
+        if (!ctx2d) return;
+        var mapper = currentResults.mapper;
+        if (!mapper.nodes.length) return;
+
+        var margin = {top: 30, right: 30, bottom: 30, left: 30};
+        var pW = W - margin.left - margin.right;
+        var pH = H - margin.top - margin.bottom;
+
+        var nNodes = mapper.nodes.length;
+        var cx = W / 2, cy = H / 2;
+        var radius = Math.min(pW, pH) * 0.35;
+
+        var nodePos = mapper.nodes.map(function(node, i) {
+            return {
+                x: cx + radius * Math.cos(2 * Math.PI * i / nNodes),
+                y: cy + radius * Math.sin(2 * Math.PI * i / nNodes)
+            };
+        });
+
+        // Edges
+        ctx2d.strokeStyle = '#2a3555'; ctx2d.lineWidth = 1;
+        for (var ei = 0; ei < mapper.edges.length; ei++) {
+            var e = mapper.edges[ei];
+            var from = nodePos[e.from], to = nodePos[e.to];
+            if (from && to) {
+                ctx2d.beginPath(); ctx2d.moveTo(from.x, from.y); ctx2d.lineTo(to.x, to.y); ctx2d.stroke();
+            }
+        }
+
+        // Nodes
+        var maxSize = Math.max.apply(null, mapper.nodes.map(function(nd) { return nd.size; }));
+        for (var ni = 0; ni < nNodes; ni++) {
+            var node = mapper.nodes[ni];
+            var r = 5 + 15 * (node.size / maxSize);
+            var hue = (200 + (node.meanFilter ?? 0) * 50) % 360;
+            ctx2d.fillStyle = 'hsl(' + hue + ', 65%, 55%)';
+            ctx2d.beginPath(); ctx2d.arc(nodePos[ni].x, nodePos[ni].y, r, 0, 2 * Math.PI); ctx2d.fill();
+        }
+
+        ctx2d.fillStyle = '#8892a8'; ctx2d.font = '11px sans-serif'; ctx2d.textAlign = 'left';
+        ctx2d.fillText(nNodes + ' nodes, ' + mapper.edges.length + ' edges', margin.left + 10, H - 10);
+    }
+
+    function updateComparisonTable() {
+        var el = document.getElementById('limb2-comparison-table');
+        if (!el || !currentResults) return;
+        var r = currentResults;
+        el.innerHTML = '<table class="results-table">' +
+            '<tr><th>Method</th><th>Transported ATE</th><th>RR</th></tr>' +
+            '<tr><td>Naive (Limb 1)</td><td>' + r.pooledYi.toFixed(4) + '</td><td>' + Math.exp(r.pooledYi).toFixed(4) + '</td></tr>' +
+            '<tr><td>IPSW</td><td>' + r.ipsw.ate_transported.toFixed(4) + '</td><td>' + Math.exp(r.ipsw.ate_transported).toFixed(4) + '</td></tr>' +
+            '<tr><td>AIPW (Doubly Robust)</td><td>' + r.aipw.ate_dr.toFixed(4) + '</td><td>' + Math.exp(r.aipw.ate_dr).toFixed(4) + '</td></tr>' +
+            '<tr><td>Sinkhorn OT</td><td>' + r.sinkhorn.ate_transported.toFixed(4) + '</td><td>' + Math.exp(r.sinkhorn.ate_transported).toFixed(4) + '</td></tr>' +
+            '<tr><td>Causal (do-calculus)</td><td>' + r.causal.ate_causal.toFixed(4) + '</td><td>' + Math.exp(r.causal.ate_causal).toFixed(4) + '</td></tr>' +
+            '<tr><td>KLIEP</td><td>' + r.kliep.ate_transported.toFixed(4) + '</td><td>' + Math.exp(r.kliep.ate_transported).toFixed(4) + '</td></tr>' +
+            '</table>';
+    }
+
+    function updateResultsTable() {
+        var el = document.getElementById('limb2-results');
+        if (!el || !currentResults) return;
+        var r = currentResults;
+        el.innerHTML = '<table class="results-table" style="margin-top:12px;">' +
+            '<tr><th>Diagnostic</th><th>Value</th></tr>' +
+            '<tr><td>MMD\u00b2 (distributional shift)</td><td>' + r.mmd.mmd2.toFixed(6) + '</td></tr>' +
+            '<tr><td>MMD p-value</td><td>' + r.mmd.pValue.toFixed(3) + ' ' + (r.mmd.significant ? '(significant)' : '(not significant)') + '</td></tr>' +
+            '<tr><td>Wasserstein W\u2082</td><td>' + r.sinkhorn.wasserstein.toFixed(4) + '</td></tr>' +
+            '<tr><td>Knockoff selected covariates</td><td>' + (r.knockoff.selected.length > 0 ? r.knockoff.selected.join(', ') : 'None (below FDR threshold)') + '</td></tr>' +
+            '</table>';
+    }
+
+    function getResults() { return currentResults; }
+
+    function exportCSV() {
+        if (!currentResults) return;
+        var r = currentResults;
+        var csv = 'method,ate_transported,rr\n';
+        csv += 'Naive,' + r.pooledYi + ',' + Math.exp(r.pooledYi) + '\n';
+        csv += 'IPSW,' + r.ipsw.ate_transported + ',' + Math.exp(r.ipsw.ate_transported) + '\n';
+        csv += 'AIPW,' + r.aipw.ate_dr + ',' + Math.exp(r.aipw.ate_dr) + '\n';
+        csv += 'Sinkhorn,' + r.sinkhorn.ate_transported + ',' + Math.exp(r.sinkhorn.ate_transported) + '\n';
+        csv += 'Causal,' + r.causal.ate_causal + ',' + Math.exp(r.causal.ate_causal) + '\n';
+        csv += 'KLIEP,' + r.kliep.ate_transported + ',' + Math.exp(r.kliep.ate_transported) + '\n';
+        var blob = new Blob([csv], {type: 'text/csv'});
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a'); a.href = url; a.download = 'limb2_transport_results.csv';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    function exportPNG() {
+        var canvas = document.getElementById('limb2-canvas');
+        if (!canvas) return;
+        var url = canvas.toDataURL('image/png');
+        var a = document.createElement('a'); a.href = url; a.download = 'limb2_plot.png';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    }
 
     return { methods, init, onDataChange, exportCSV, exportPNG, getResults };
 })();
@@ -3217,6 +3703,23 @@ TestRunner.register('M17: KLIEP transported effect', function() {
     const ipd = DataLayer.generateTransportIPD({yi: -0.25}, ctx, 100, 100, 42);
     const res = Limb2.methods.kliepTransport(ipd.trialIPD, ipd.targetIPD);
     if (typeof res.ate_transported !== 'number' || isNaN(res.ate_transported)) throw new Error('NaN');
+});
+
+// ---- T52: Full Limb 2 pipeline integration test ----
+TestRunner.register('Integration: Limb2 full pipeline', function() {
+    DataLayer.load('colchicine');
+    if (typeof Limb1 !== 'undefined') {
+        Limb1.onDataChange(DataLayer.getActive());
+    }
+    Limb2.onDataChange();
+    const res = Limb2.getResults();
+    if (!res) throw new Error('No Limb2 results');
+    if (typeof res.ipsw.ate_transported !== 'number' || isNaN(res.ipsw.ate_transported)) throw new Error('IPSW failed');
+    if (typeof res.aipw.ate_dr !== 'number' || isNaN(res.aipw.ate_dr)) throw new Error('AIPW failed');
+    if (typeof res.sinkhorn.ate_transported !== 'number' || isNaN(res.sinkhorn.ate_transported)) throw new Error('Sinkhorn failed');
+    if (typeof res.causal.ate_causal !== 'number' || isNaN(res.causal.ate_causal)) throw new Error('Causal failed');
+    if (typeof res.kliep.ate_transported !== 'number' || isNaN(res.kliep.ate_transported)) throw new Error('KLIEP failed');
+    if (res.mapper.nodes.length === 0) throw new Error('Mapper empty');
 });
 </script>
 
