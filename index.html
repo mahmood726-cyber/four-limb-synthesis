@@ -705,7 +705,72 @@ const MathCore = (() => {
         return { newtonRaphson, goldenSection };
     })();
 
-    return { random, linalg, stats, optim };
+    // --- TDA: Persistent Homology ---
+    const tda = (() => {
+        // Union-Find for H0 tracking
+        function makeUF(n) {
+            const parent = Array.from({length: n}, function(_, i) { return i; });
+            const rank = new Uint8Array(n);
+            function find(x) {
+                while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+                return x;
+            }
+            function union(a, b) {
+                a = find(a); b = find(b);
+                if (a === b) return false;
+                if (rank[a] < rank[b]) { const tmp = a; a = b; b = tmp; }
+                parent[b] = a;
+                if (rank[a] === rank[b]) rank[a]++;
+                return true;
+            }
+            return { find: find, union: union };
+        }
+
+        // Vietoris-Rips persistent homology (H0 and simplified H1)
+        // Input: k×k distance matrix (plain array of arrays or Float64Arrays)
+        // Output: {h0: [{birth, death}], h1: [{birth, death}]}
+        function vietorisRips(distMatrix) {
+            const n = distMatrix.length;
+            const edges = [];
+            for (let i = 0; i < n; i++) {
+                for (let j = i + 1; j < n; j++) {
+                    edges.push({i: i, j: j, d: distMatrix[i][j]});
+                }
+            }
+            edges.sort(function(a, b) { return a.d - b.d; });
+
+            const uf = makeUF(n);
+            const births = new Float64Array(n); // All components born at 0
+            const h0 = [];
+            const adj = Array.from({length: n}, function() { return new Set(); });
+            const h1 = [];
+
+            for (let ei = 0; ei < edges.length; ei++) {
+                const edge = edges[ei];
+                const i = edge.i, j = edge.j, d = edge.d;
+                const ri = uf.find(i), rj = uf.find(j);
+
+                if (ri !== rj) {
+                    // Merging two components — the younger dies
+                    h0.push({birth: 0, death: d});
+                    uf.union(i, j);
+                } else {
+                    // Same component — potential H1 cycle
+                    if (!adj[i].has(j)) {
+                        h1.push({birth: d, death: Infinity});
+                    }
+                }
+                adj[i].add(j);
+                adj[j].add(i);
+            }
+
+            return {h0: h0, h1: h1};
+        }
+
+        return { vietorisRips: vietorisRips };
+    })();
+
+    return { random, linalg, stats, optim, tda };
 })();
 </script>
 
@@ -1176,6 +1241,147 @@ const Limb1 = (() => {
         return results;
     };
 
+    // M6: Rao (Fisher) geodesic distance between two normal distributions
+    // Uses the simplified form: d² = (mu1-mu2)²/(s1*s2) + 2*log(s2/s1)²
+    methods.raoDistance = function(mu1, vi1, mu2, vi2) {
+        const s1 = Math.sqrt(vi1), s2 = Math.sqrt(vi2);
+        const logRatio = Math.log(s2 / s1);
+        const meanDiffSq = (mu1 - mu2) * (mu1 - mu2);
+        return Math.sqrt(meanDiffSq / (s1 * s2) + 2 * logRatio * logRatio);
+    };
+
+    // M6b: Compute full k×k geodesic distance matrix
+    methods.geodesicDistanceMatrix = function(yi, vi) {
+        const k = yi.length;
+        const D = Array.from({length: k}, function() { return new Float64Array(k); });
+        for (let i = 0; i < k; i++) {
+            for (let j = i + 1; j < k; j++) {
+                const d = methods.raoDistance(yi[i], vi[i], yi[j], vi[j]);
+                D[i][j] = d;
+                D[j][i] = d;
+            }
+        }
+        return D;
+    };
+
+    // M7: Spectral heterogeneity decomposition
+    methods.spectralDecomposition = function(yi, vi) {
+        const k = yi.length;
+        let mu = 0;
+        for (let i = 0; i < k; i++) mu += yi[i];
+        mu /= k;
+        const residuals = yi.map(function(y) { return y - mu; });
+        const covArr = [];
+        for (let i = 0; i < k; i++) {
+            const row = [];
+            for (let j = 0; j < k; j++) {
+                row.push(i === j ? residuals[i] * residuals[j] : residuals[i] * residuals[j] * 0.5);
+            }
+            covArr.push(row);
+        }
+        const covMatrix = MathCore.linalg.fromArray(covArr);
+        const eig = MathCore.linalg.eigenSymmetric(covMatrix);
+        const values = eig.values;
+        const vectors = eig.vectors;
+        const totalVar = Array.from(values).reduce(function(a, b) { return a + Math.max(0, b); }, 0);
+        const proportions = Array.from(values).map(function(v) { return totalVar > 0 ? Math.max(0, v) / totalVar : 0; });
+        return {
+            eigenvalues: Array.from(values),
+            eigenvectors: vectors,
+            proportions: proportions,
+            totalVariance: totalVar
+        };
+    };
+
+    // M8: Classical MDS (Torgersen) from distance matrix
+    methods.mds = function(distMatrix, dims) {
+        dims = dims === undefined ? 2 : dims;
+        const n = distMatrix.length;
+        const D2 = Array.from({length: n}, function(_, i) {
+            return Array.from({length: n}, function(_, j) { return distMatrix[i][j] * distMatrix[i][j]; });
+        });
+        const rowMeans = D2.map(function(row) { return row.reduce(function(a, b) { return a + b; }, 0) / n; });
+        const colMeans = new Float64Array(n);
+        for (let j = 0; j < n; j++) {
+            for (let i = 0; i < n; i++) colMeans[j] += D2[i][j];
+            colMeans[j] /= n;
+        }
+        let grandMean = 0;
+        for (let i = 0; i < n; i++) grandMean += rowMeans[i];
+        grandMean /= n;
+        const B = [];
+        for (let i = 0; i < n; i++) {
+            const row = [];
+            for (let j = 0; j < n; j++) {
+                row.push(-0.5 * (D2[i][j] - rowMeans[i] - colMeans[j] + grandMean));
+            }
+            B.push(row);
+        }
+        const Bm = MathCore.linalg.fromArray(B);
+        const eig = MathCore.linalg.eigenSymmetric(Bm);
+        const values = eig.values;
+        const vectors = eig.vectors;
+        const coords = [];
+        for (let i = 0; i < n; i++) {
+            const point = [];
+            for (let d = 0; d < dims; d++) {
+                const lambda = Math.max(0, values[d]);
+                point.push(MathCore.linalg.get(vectors, i, d) * Math.sqrt(lambda));
+            }
+            coords.push(point);
+        }
+        return coords;
+    };
+
+    // M8b: Hierarchical clustering on distance matrix (single linkage)
+    methods.hierarchicalCluster = function(distMatrix, nClusters) {
+        nClusters = nClusters === undefined ? 2 : nClusters;
+        const n = distMatrix.length;
+        const clusters = Array.from({length: n}, function(_, i) { return [i]; });
+        while (clusters.length > nClusters) {
+            let minDist = Infinity, mi = -1, mj = -1;
+            for (let i = 0; i < clusters.length; i++) {
+                for (let j = i + 1; j < clusters.length; j++) {
+                    for (let ai = 0; ai < clusters[i].length; ai++) {
+                        for (let bi = 0; bi < clusters[j].length; bi++) {
+                            const a = clusters[i][ai], b = clusters[j][bi];
+                            if (distMatrix[a][b] < minDist) { minDist = distMatrix[a][b]; mi = i; mj = j; }
+                        }
+                    }
+                }
+            }
+            clusters[mi] = clusters[mi].concat(clusters[mj]);
+            clusters.splice(mj, 1);
+        }
+        const result = new Array(n);
+        clusters.forEach(function(cluster, ci) {
+            for (let idx = 0; idx < cluster.length; idx++) result[cluster[idx]] = ci;
+        });
+        return result;
+    };
+
+    // M10: Conformal prediction interval (split-conformal)
+    methods.conformalPI = function(yi, vi, tau2, mu, coverage) {
+        coverage = coverage === undefined ? 0.95 : coverage;
+        const k = yi.length;
+        if (k < 4) return { lower: -Infinity, upper: Infinity, scores: [], quantile: 0 };
+        const scores = yi.map(function(y, i) { return Math.abs(y - mu) / Math.sqrt(vi[i] + tau2); });
+        const sortedScores = Float64Array.from(scores).sort();
+        const alpha = 1 - coverage;
+        const idx = Math.min(Math.ceil((1 - alpha) * (k + 1)) - 1, k - 1);
+        const q = sortedScores[idx];
+        let viSum = 0;
+        for (let i = 0; i < k; i++) viSum += vi[i];
+        const viNew = viSum / k;
+        const scale = Math.sqrt(viNew + tau2);
+        return {
+            lower: mu - q * scale,
+            upper: mu + q * scale,
+            quantile: q,
+            scores: Array.from(scores)
+        };
+    };
+
     // Public API stubs (filled in later tasks)
     function init() {}
     function onDataChange(data) {}
@@ -1427,6 +1633,80 @@ TestRunner.register('M5: Node-split no inconsistency on consistent data', functi
     const res = Limb1.methods.nodeSplit(trials);
     const comp12 = res.find(function(r) { return r.comparison === '1v2'; });
     if (comp12 && comp12.inconsistent) throw new Error('False inconsistency detected');
+});
+
+// ---- T25: Rao distance between identical studies is 0 ----
+TestRunner.register('M6: Rao distance self=0', function() {
+    const d = Limb1.methods.raoDistance(0.5, 0.1, 0.5, 0.1);
+    if (Math.abs(d) > 1e-10) throw new Error('Distance = ' + d + ', expected 0');
+});
+
+// ---- T26: Rao distance > 0 when precisions differ (same mean) ----
+TestRunner.register('M6: Rao > 0 when precisions differ', function() {
+    const rao = Limb1.methods.raoDistance(-0.3, 0.01, -0.3, 0.5);
+    if (rao <= 0) throw new Error('Rao = ' + rao + ', expected > 0 due to precision difference');
+});
+
+// ---- T27: Spectral eigenvalues are non-negative in sum ----
+TestRunner.register('M7: Spectral eigenvalues sum non-negative', function() {
+    const yi = [-0.3, -0.1, -0.5, -0.2, -0.4];
+    const vi = [0.01, 0.02, 0.01, 0.03, 0.02];
+    const res = Limb1.methods.spectralDecomposition(yi, vi);
+    const totalFromEigen = res.eigenvalues.reduce(function(a, b) { return a + b; }, 0);
+    if (totalFromEigen < 0) throw new Error('Negative total variance from eigenvalues: ' + totalFromEigen);
+});
+
+// ---- T28: MDS produces correct dimensionality (k points × 2D) ----
+TestRunner.register('M8: MDS produces correct dimensionality', function() {
+    const distMatrix = [
+        [0, 1, 2, 3],
+        [1, 0, 1.5, 2.5],
+        [2, 1.5, 0, 1],
+        [3, 2.5, 1, 0]
+    ];
+    const coords = Limb1.methods.mds(distMatrix, 2);
+    if (coords.length !== 4) throw new Error('Expected 4 points, got ' + coords.length);
+    if (coords[0].length !== 2) throw new Error('Expected 2D, got ' + coords[0].length + 'D');
+});
+
+// ---- T29: TDA H0 on 3 well-separated points ----
+TestRunner.register('M9: TDA H0 on 3 well-separated points', function() {
+    const D = [[0, 1, 10], [1, 0, 10], [10, 10, 0]];
+    const ph = MathCore.tda.vietorisRips(D);
+    if (ph.h0.length !== 2) throw new Error('Expected 2 H0 features, got ' + ph.h0.length);
+    const deaths = ph.h0.map(function(f) { return f.death; }).sort(function(a, b) { return a - b; });
+    if (Math.abs(deaths[0] - 1) > 0.01) throw new Error('First death at ' + deaths[0] + ', expected 1');
+    if (Math.abs(deaths[1] - 10) > 0.01) throw new Error('Second death at ' + deaths[1] + ', expected 10');
+});
+
+// ---- T30: TDA on geodesic distance matrix (5 points → 4 H0) ----
+TestRunner.register('M9: TDA on geodesic distance matrix', function() {
+    const yi = [-0.3, -0.1, -0.5, -0.2, -0.4];
+    const vi = [0.01, 0.02, 0.01, 0.03, 0.02];
+    const D = Limb1.methods.geodesicDistanceMatrix(yi, vi);
+    const ph = MathCore.tda.vietorisRips(D);
+    if (ph.h0.length !== 4) throw new Error('Expected 4 H0 features, got ' + ph.h0.length);
+});
+
+// ---- T31: Conformal PI covers plausible range ----
+TestRunner.register('M10: Conformal PI covers future point', function() {
+    MathCore.random.seed(42);
+    const yi = [], vi = [];
+    for (let i = 0; i < 20; i++) { yi.push(MathCore.random.normal(-0.3, 0.15)); vi.push(0.02); }
+    const tau2 = 0.02;
+    let muSum = 0; for (let i = 0; i < yi.length; i++) muSum += yi[i]; const mu = muSum / yi.length;
+    const res = Limb1.methods.conformalPI(yi, vi, tau2, mu, 0.95);
+    if (res.lower > 0 || res.upper < -0.6) throw new Error('PI [' + res.lower.toFixed(3) + ', ' + res.upper.toFixed(3) + '] does not contain plausible range');
+});
+
+// ---- T32: Conformal PI has positive width ----
+TestRunner.register('M10: Conformal PI exists and has width', function() {
+    const yi = [-0.3, -0.1, -0.5, -0.2, -0.4, -0.6, -0.15, -0.35];
+    const vi = [0.01, 0.02, 0.01, 0.03, 0.02, 0.01, 0.015, 0.025];
+    const tau2 = 0.03;
+    let muSum = 0; for (let i = 0; i < yi.length; i++) muSum += yi[i]; const mu = muSum / yi.length;
+    const res = Limb1.methods.conformalPI(yi, vi, tau2, mu, 0.95);
+    if (res.upper <= res.lower) throw new Error('PI has zero or negative width: [' + res.lower + ', ' + res.upper + ']');
 });
 </script>
 
