@@ -1310,6 +1310,7 @@ const App = (() => {
         // Initialize Limb1 visualization
         Limb1.init();
         if (typeof Limb2 !== 'undefined') Limb2.init();
+        if (typeof Limb3 !== 'undefined') Limb3.init();
     }
 
     function updateStatus(msg) {
@@ -3965,12 +3966,423 @@ const Limb3 = (() => {
         };
     };
 
-    // Public API stubs (filled in Task 6)
-    function init() {}
-    function onDataChange() {}
-    function exportCSV() {}
-    function exportPNG() {}
-    function getResults() { return null; }
+    const METHOD_LIST = [
+        {id: 'sde', label: 'Bass SDE Paths'},
+        {id: 'mfg', label: 'Mean-Field Game'},
+        {id: 'hjb', label: 'HJB Optimal Control'},
+        {id: 'hmm', label: 'Regime Switching'},
+        {id: 'network', label: 'Network Diffusion'},
+        {id: 'options', label: 'Real Options'},
+        {id: 'neuralode', label: 'Neural ODE'},
+        {id: 'pareto', label: 'Pareto Front'},
+    ];
+
+    let activeMethod = 'sde';
+    let currentResults = null;
+
+    function init() {
+        const bar = document.getElementById('limb3-methods');
+        if (!bar) return;
+        bar.innerHTML = '';
+        for (const m of METHOD_LIST) {
+            const btn = document.createElement('button');
+            btn.className = 'method-btn' + (m.id === activeMethod ? ' active' : '');
+            btn.textContent = m.label;
+            btn.addEventListener('click', () => {
+                activeMethod = m.id;
+                bar.querySelectorAll('.method-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                render();
+            });
+            bar.appendChild(btn);
+        }
+
+        // Wire parameter sliders
+        ['limb3-p', 'limb3-q', 'limb3-sigma', 'limb3-r'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.addEventListener('input', () => { onDataChange(); });
+        });
+
+        onDataChange();
+    }
+
+    function getSliderParams() {
+        const getVal = (id, def) => { const el = document.getElementById(id); return el ? parseFloat(el.value) : def; };
+        return {
+            pBase: getVal('limb3-p', 0.03),
+            qBase: getVal('limb3-q', 0.38),
+            sigma: getVal('limb3-sigma', 0.15),
+            r: getVal('limb3-r', 0.05)
+        };
+    }
+
+    function onDataChange() {
+        const ctx2025 = DataLayer.getContext().filter(c => c.year === 2025);
+        if (ctx2025.length === 0) return;
+
+        const params = getSliderParams();
+
+        const sde = methods.bassSDE(ctx2025, {nPaths: 50, tMax: 10, sigma: params.sigma, seed: 42, pBase: params.pBase, qBase: params.qBase});
+        const mfg = methods.meanFieldGame(ctx2025, {maxIter: 100, seed: 42});
+        const hjb = methods.hjbControl({benefit: 0.8, cost: 100, sigma: params.sigma, r: params.r, T: 10, nGrid: 30});
+        const network = methods.networkDiffusion(ctx2025, {tMax: 10, dt: 0.1, alpha: 0.1, pBase: params.pBase, qBase: params.qBase});
+
+        // HMM: generate synthetic observations from health expenditure
+        const hmmObs = ctx2025.map(ctx => {
+            const obs = [];
+            for (let t = 0; t < 20; t++) {
+                MathCore.random.seed(42 + t);
+                obs.push(ctx.adoption_readiness + MathCore.random.normal(0, 0.15));
+            }
+            return {region: ctx.region, observations: obs, decoded: methods.hmmDecode(obs)};
+        });
+
+        // Real options per region
+        const options = ctx2025.map(ctx => ({
+            region: ctx.region,
+            result: methods.realOptions({
+                benefit: ctx.health_exp_per_capita * 0.05,
+                cost: ctx.treatment_cost_usd * 10,
+                sigma: params.sigma, r: params.r, delta: 0.02
+            })
+        }));
+
+        // Neural ODE: train on the first region's deterministic Bass curve
+        const bassTarget = sde[0].detPath.filter((_, i) => i % 10 === 0).map(p => ({t: p.t, y: p.y}));
+        const neuralODE = methods.neuralODE(bassTarget, {epochs: 50, hiddenSize: 8, seed: 42});
+
+        // Pareto optimization
+        const pareto = methods.paretoOptimize(ctx2025, {popSize: 30, generations: 50, seed: 42});
+
+        currentResults = {sde, mfg, hjb, hmmResults: hmmObs, network, options, neuralODE, pareto, ctx: ctx2025};
+        render();
+    }
+
+    function render() {
+        if (!currentResults) return;
+        const canvas = document.getElementById('limb3-canvas');
+        if (!canvas) return;
+        const ctx2d = (typeof canvas.getContext === 'function') ? canvas.getContext('2d') : null;
+        if (!ctx2d) return;
+        const W = canvas.width, H = canvas.height;
+        ctx2d.clearRect(0, 0, W, H);
+        const title = document.getElementById('limb3-viz-title');
+
+        switch (activeMethod) {
+            case 'sde': if (title) title.textContent = 'Bass SDE Sample Paths'; drawSDE(ctx2d, W, H); break;
+            case 'mfg': if (title) title.textContent = 'Mean-Field Game Equilibrium'; drawMFG(ctx2d, W, H); break;
+            case 'hjb': if (title) title.textContent = 'HJB Optimal Control Policy'; drawHJB(ctx2d, W, H); break;
+            case 'hmm': if (title) title.textContent = 'Regime-Switching HMM'; drawHMM(ctx2d, W, H); break;
+            case 'network': if (title) title.textContent = 'Network Diffusion Across Regions'; drawNetwork(ctx2d, W, H); break;
+            case 'options': if (title) title.textContent = 'Real Options vs Naive NPV'; drawOptions(ctx2d, W, H); break;
+            case 'neuralode': if (title) title.textContent = 'Neural ODE vs Bass Model'; drawNeuralODE(ctx2d, W, H); break;
+            case 'pareto': if (title) title.textContent = 'Pareto Front (Benefit x Cost x Equity)'; drawPareto(ctx2d, W, H); break;
+        }
+        updateSummaryTable();
+    }
+
+    const REGION_COLORS = ['#4e8cff', '#34d399', '#fbbf24', '#fb923c'];
+
+    function drawSDE(ctx2d, W, H) {
+        const margin = {top: 30, right: 30, bottom: 50, left: 60};
+        const pW = W - margin.left - margin.right, pH = H - margin.top - margin.bottom;
+
+        for (let r = 0; r < currentResults.sde.length; r++) {
+            const {bands, region} = currentResults.sde[r];
+            if (bands.length === 0) continue;
+            const color = REGION_COLORS[r % 4];
+
+            // 95% band
+            ctx2d.fillStyle = color; ctx2d.globalAlpha = 0.1;
+            ctx2d.beginPath();
+            for (let i = 0; i < bands.length; i++) {
+                const x = margin.left + (bands[i].t / 10) * pW;
+                const y = margin.top + (1 - (bands[i]['q0.975'] ?? 0) / 0.85) * pH;
+                if (i === 0) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+            }
+            for (let i = bands.length - 1; i >= 0; i--) {
+                const x = margin.left + (bands[i].t / 10) * pW;
+                const y = margin.top + (1 - (bands[i]['q0.025'] ?? 0) / 0.85) * pH;
+                ctx2d.lineTo(x, y);
+            }
+            ctx2d.closePath(); ctx2d.fill();
+            ctx2d.globalAlpha = 1;
+
+            // Median line
+            ctx2d.strokeStyle = color; ctx2d.lineWidth = 2;
+            ctx2d.beginPath();
+            for (let i = 0; i < bands.length; i++) {
+                const x = margin.left + (bands[i].t / 10) * pW;
+                const y = margin.top + (1 - (bands[i]['q0.5'] ?? 0) / 0.85) * pH;
+                if (i === 0) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+            }
+            ctx2d.stroke();
+
+            // Label
+            ctx2d.fillStyle = color; ctx2d.font = '10px sans-serif'; ctx2d.textAlign = 'left';
+            const lastBand = bands[bands.length - 1];
+            const ly = margin.top + (1 - (lastBand['q0.5'] ?? 0) / 0.85) * pH;
+            ctx2d.fillText(region, W - margin.right + 4, ly);
+        }
+
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '12px sans-serif'; ctx2d.textAlign = 'center';
+        ctx2d.fillText('Years from launch', W / 2, H - 10);
+    }
+
+    function drawMFG(ctx2d, W, H) {
+        const {mfg} = currentResults;
+        const margin = {top: 30, right: 30, bottom: 50, left: 120};
+        const pW = W - margin.left - margin.right, pH = H - margin.top - margin.bottom;
+
+        for (let i = 0; i < mfg.equilibrium.length; i++) {
+            const e = mfg.equilibrium[i];
+            const y = margin.top + (i + 0.5) / mfg.equilibrium.length * pH;
+            const barW = (e.adoption / 0.8) * pW;
+            const indW = (e.independent / 0.8) * pW;
+
+            // Independent (grey)
+            ctx2d.fillStyle = '#2a3555'; ctx2d.fillRect(margin.left, y - 12, indW, 10);
+            // Nash equilibrium (color)
+            ctx2d.fillStyle = REGION_COLORS[i]; ctx2d.fillRect(margin.left, y + 2, barW, 10);
+
+            ctx2d.fillStyle = '#e0e6f0'; ctx2d.textAlign = 'right'; ctx2d.font = '11px sans-serif';
+            ctx2d.fillText(e.region, margin.left - 8, y + 4);
+
+            ctx2d.textAlign = 'left'; ctx2d.fillStyle = '#8892a8'; ctx2d.font = '10px sans-serif';
+            ctx2d.fillText('Nash: ' + (e.adoption*100).toFixed(0) + '%  Ind: ' + (e.independent*100).toFixed(0) + '%  Gap: ' + (e.strategicGap*100).toFixed(1) + '%', margin.left + Math.max(barW, indW) + 8, y + 4);
+        }
+        ctx2d.fillStyle = '#2a3555'; ctx2d.fillRect(W - 180, 10, 10, 10);
+        ctx2d.fillStyle = '#4e8cff'; ctx2d.fillRect(W - 180, 26, 10, 10);
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '10px sans-serif'; ctx2d.textAlign = 'left';
+        ctx2d.fillText('Independent', W - 166, 19);
+        ctx2d.fillText('Nash Equilibrium', W - 166, 35);
+    }
+
+    function drawHJB(ctx2d, W, H) {
+        const {hjb} = currentResults;
+        const margin = {top: 30, right: 30, bottom: 50, left: 60};
+        const pW = W - margin.left - margin.right, pH = H - margin.top - margin.bottom;
+
+        const maxPolicy = Math.max(...hjb.policy);
+        for (let i = 0; i < hjb.xGrid.length; i++) {
+            const x = margin.left + (hjb.xGrid[i] / 0.8) * pW;
+            const barH = (hjb.policy[i] / (maxPolicy + 0.01)) * pH;
+            const hue = 120 + (hjb.policy[i] / (maxPolicy + 0.01)) * 100;
+            ctx2d.fillStyle = 'hsl(' + hue + ', 65%, 50%)';
+            ctx2d.fillRect(x - 8, margin.top + pH - barH, 16, barH);
+        }
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '12px sans-serif'; ctx2d.textAlign = 'center';
+        ctx2d.fillText('Current Adoption Level', W / 2, H - 10);
+        ctx2d.save(); ctx2d.translate(15, H / 2); ctx2d.rotate(-Math.PI / 2);
+        ctx2d.fillText('Optimal Intensity', 0, 0); ctx2d.restore();
+    }
+
+    function drawHMM(ctx2d, W, H) {
+        const {hmmResults} = currentResults;
+        const margin = {top: 30, right: 30, bottom: 50, left: 120};
+        const pH = H - margin.top - margin.bottom;
+        const pW = W - margin.left - margin.right;
+        const stateColors = ['#4e8cff', '#f87171', '#34d399'];
+
+        for (let r = 0; r < hmmResults.length; r++) {
+            const {region, decoded} = hmmResults[r];
+            const y0 = margin.top + r * (pH / hmmResults.length);
+            const rowH = pH / hmmResults.length - 4;
+
+            ctx2d.fillStyle = '#e0e6f0'; ctx2d.textAlign = 'right'; ctx2d.font = '10px sans-serif';
+            ctx2d.fillText(region, margin.left - 8, y0 + rowH / 2 + 3);
+
+            const T = decoded.states.length;
+            const segW = pW / T;
+            for (let t = 0; t < T; t++) {
+                ctx2d.fillStyle = stateColors[decoded.states[t]];
+                ctx2d.fillRect(margin.left + t * segW, y0, segW - 1, rowH);
+            }
+        }
+        // Legend
+        const labels = ['Normal', 'Crisis', 'Reform'];
+        for (let k = 0; k < 3; k++) {
+            ctx2d.fillStyle = stateColors[k]; ctx2d.fillRect(W - 200 + k * 70, H - 20, 10, 10);
+            ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '10px sans-serif'; ctx2d.textAlign = 'left';
+            ctx2d.fillText(labels[k], W - 186 + k * 70, H - 11);
+        }
+    }
+
+    function drawNetwork(ctx2d, W, H) {
+        const {network} = currentResults;
+        const margin = {top: 30, right: 30, bottom: 50, left: 60};
+        const pW = W - margin.left - margin.right, pH = H - margin.top - margin.bottom;
+
+        for (let r = 0; r < network.trajectories.length; r++) {
+            const {path, region} = network.trajectories[r];
+            ctx2d.strokeStyle = REGION_COLORS[r]; ctx2d.lineWidth = 2;
+            ctx2d.beginPath();
+            for (let i = 0; i < path.length; i++) {
+                const x = margin.left + (path[i].t / 10) * pW;
+                const y = margin.top + (1 - path[i].y / 0.85) * pH;
+                if (i === 0) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+            }
+            ctx2d.stroke();
+            const last = path[path.length - 1];
+            ctx2d.fillStyle = REGION_COLORS[r]; ctx2d.font = '10px sans-serif'; ctx2d.textAlign = 'left';
+            ctx2d.fillText(region, W - margin.right + 4, margin.top + (1 - last.y / 0.85) * pH);
+        }
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '12px sans-serif'; ctx2d.textAlign = 'center';
+        ctx2d.fillText('Years', W / 2, H - 10);
+    }
+
+    function drawOptions(ctx2d, W, H) {
+        const {options} = currentResults;
+        const margin = {top: 30, right: 30, bottom: 50, left: 120};
+        const pW = W - margin.left - margin.right, pH = H - margin.top - margin.bottom;
+        const maxThresh = Math.max(...options.map(o => o.result.optionThreshold));
+
+        for (let i = 0; i < options.length; i++) {
+            const {region, result} = options[i];
+            const y = margin.top + (i + 0.5) / options.length * pH;
+
+            // Naive threshold (grey)
+            const naiveW = (result.naiveThreshold / maxThresh) * pW * 0.8;
+            ctx2d.fillStyle = '#2a3555'; ctx2d.fillRect(margin.left, y - 8, naiveW, 7);
+
+            // Option threshold (colored)
+            const optW = (result.optionThreshold / maxThresh) * pW * 0.8;
+            ctx2d.fillStyle = REGION_COLORS[i]; ctx2d.fillRect(margin.left, y + 2, optW, 7);
+
+            ctx2d.fillStyle = '#e0e6f0'; ctx2d.textAlign = 'right'; ctx2d.font = '11px sans-serif';
+            ctx2d.fillText(region, margin.left - 8, y + 4);
+
+            ctx2d.fillStyle = '#8892a8'; ctx2d.textAlign = 'left'; ctx2d.font = '10px sans-serif';
+            ctx2d.fillText('Premium: +' + result.waitingPremium.toFixed(0) + '%', margin.left + optW + 8, y + 4);
+        }
+    }
+
+    function drawNeuralODE(ctx2d, W, H) {
+        const {neuralODE, sde} = currentResults;
+        const margin = {top: 30, right: 30, bottom: 50, left: 60};
+        const pW = W - margin.left - margin.right, pH = H - margin.top - margin.bottom;
+        const tMax = sde[0].detPath[sde[0].detPath.length - 1].t;
+
+        // Bass deterministic (blue)
+        ctx2d.strokeStyle = '#4e8cff'; ctx2d.lineWidth = 2;
+        ctx2d.beginPath();
+        for (const p of sde[0].detPath) {
+            const x = margin.left + (p.t / tMax) * pW;
+            const y = margin.top + (1 - p.y / 0.85) * pH;
+            if (p === sde[0].detPath[0]) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+        }
+        ctx2d.stroke();
+
+        // Neural ODE (green dashed)
+        ctx2d.strokeStyle = '#34d399'; ctx2d.lineWidth = 2; ctx2d.setLineDash([4, 2]);
+        ctx2d.beginPath();
+        for (const p of neuralODE.predictedPath) {
+            const x = margin.left + (p.t / tMax) * pW;
+            const y = margin.top + (1 - Math.max(0, p.y) / 0.85) * pH;
+            if (p === neuralODE.predictedPath[0]) ctx2d.moveTo(x, y); else ctx2d.lineTo(x, y);
+        }
+        ctx2d.stroke(); ctx2d.setLineDash([]);
+
+        // Target points (orange dots)
+        ctx2d.fillStyle = '#fb923c';
+        for (const p of neuralODE.targetData) {
+            const x = margin.left + (p.t / tMax) * pW;
+            const y = margin.top + (1 - p.y / 0.85) * pH;
+            ctx2d.beginPath(); ctx2d.arc(x, y, 4, 0, 2 * Math.PI); ctx2d.fill();
+        }
+
+        // Legend
+        ctx2d.fillStyle = '#4e8cff'; ctx2d.fillRect(W - 180, 10, 20, 3);
+        ctx2d.fillStyle = '#34d399'; ctx2d.fillRect(W - 180, 26, 20, 3);
+        ctx2d.fillStyle = '#fb923c'; ctx2d.beginPath(); ctx2d.arc(W - 170, 42, 3, 0, 2*Math.PI); ctx2d.fill();
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '10px sans-serif'; ctx2d.textAlign = 'left';
+        ctx2d.fillText('Bass Model', W - 155, 14); ctx2d.fillText('Neural ODE', W - 155, 30);
+        ctx2d.fillText('Training Data', W - 155, 46);
+
+        ctx2d.fillStyle = '#8892a8'; ctx2d.font = '10px sans-serif'; ctx2d.textAlign = 'left';
+        ctx2d.fillText('Loss: ' + neuralODE.initialLoss.toFixed(4) + ' -> ' + neuralODE.finalLoss.toFixed(4), margin.left + 10, margin.top + 16);
+    }
+
+    function drawPareto(ctx2d, W, H) {
+        const {pareto} = currentResults;
+        const margin = {top: 30, right: 30, bottom: 50, left: 60};
+        const pW = W - margin.left - margin.right, pH = H - margin.top - margin.bottom;
+
+        const front = pareto.paretoFront;
+        const allBenefit = pareto.allSolutions.map(s => s.benefit);
+        const allCost = pareto.allSolutions.map(s => s.cost);
+        const bMin = Math.min(...allBenefit), bMax = Math.max(...allBenefit);
+        const cMin = Math.min(...allCost), cMax = Math.max(...allCost);
+        const bRange = bMax - bMin || 1, cRange = cMax - cMin || 1;
+
+        // All solutions (grey dots)
+        ctx2d.fillStyle = '#2a3555';
+        for (const s of pareto.allSolutions) {
+            const x = margin.left + ((s.benefit - bMin) / bRange) * pW;
+            const y = margin.top + ((s.cost - cMin) / cRange) * pH;
+            ctx2d.beginPath(); ctx2d.arc(x, y, 2, 0, 2 * Math.PI); ctx2d.fill();
+        }
+
+        // Pareto front (colored by equity)
+        for (const s of front) {
+            const x = margin.left + ((s.benefit - bMin) / bRange) * pW;
+            const y = margin.top + ((s.cost - cMin) / cRange) * pH;
+            const hue = 120 * s.equity; // Green = high equity
+            ctx2d.fillStyle = 'hsl(' + hue + ', 70%, 55%)';
+            ctx2d.beginPath(); ctx2d.arc(x, y, 6, 0, 2 * Math.PI); ctx2d.fill();
+            ctx2d.strokeStyle = '#fff'; ctx2d.lineWidth = 1; ctx2d.stroke();
+        }
+
+        ctx2d.fillStyle = '#e0e6f0'; ctx2d.font = '12px sans-serif'; ctx2d.textAlign = 'center';
+        ctx2d.fillText('Total Benefit (events prevented)', W / 2, H - 10);
+        ctx2d.save(); ctx2d.translate(15, H / 2); ctx2d.rotate(-Math.PI / 2);
+        ctx2d.fillText('Total Cost (USD)', 0, 0); ctx2d.restore();
+
+        ctx2d.fillStyle = '#8892a8'; ctx2d.font = '10px sans-serif'; ctx2d.textAlign = 'left';
+        ctx2d.fillText(pareto.nParetoOptimal + ' Pareto-optimal solutions (color = equity)', margin.left + 10, margin.top + 16);
+    }
+
+    function updateSummaryTable() {
+        const el = document.getElementById('limb3-summary-table');
+        if (!el || !currentResults) return;
+        const {sde, mfg, options} = currentResults;
+
+        let html = '<table class="results-table"><tr><th>Region</th><th>SDE Median (10y)</th><th>MFG Nash</th><th>Options Premium</th></tr>';
+        for (let i = 0; i < sde.length; i++) {
+            html += '<tr><td>' + sde[i].region + '</td>';
+            html += '<td>' + (sde[i].finalMedian * 100).toFixed(1) + '%</td>';
+            html += '<td>' + (mfg.equilibrium[i].adoption * 100).toFixed(1) + '%</td>';
+            html += '<td>+' + options[i].result.waitingPremium.toFixed(0) + '%</td></tr>';
+        }
+        html += '</table>';
+        el.innerHTML = html;
+    }
+
+    function getResults() { return currentResults; }
+
+    function exportCSV() {
+        if (!currentResults) return;
+        const {sde, mfg, options} = currentResults;
+        let csv = 'region,sde_median_10y,mfg_nash,mfg_independent,option_threshold,naive_threshold\n';
+        for (let i = 0; i < sde.length; i++) {
+            csv += sde[i].region + ',' + sde[i].finalMedian.toFixed(4) + ',' + mfg.equilibrium[i].adoption.toFixed(4) + ',';
+            csv += mfg.equilibrium[i].independent.toFixed(4) + ',' + options[i].result.optionThreshold.toFixed(1) + ',';
+            csv += options[i].result.naiveThreshold.toFixed(1) + '\n';
+        }
+        const blob = new Blob([csv], {type: 'text/csv'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'limb3_economics_results.csv';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    function exportPNG() {
+        const canvas = document.getElementById('limb3-canvas');
+        if (!canvas) return;
+        const url = canvas.toDataURL('image/png');
+        const a = document.createElement('a'); a.href = url; a.download = 'limb3_plot.png';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    }
 
     return { methods, init, onDataChange, exportCSV, exportPNG, getResults };
 })();
@@ -4643,6 +5055,18 @@ TestRunner.register('M25: Neural ODE prediction in [-0.5, 2]', function() {
     for (const p of res.predictedPath) {
         if (p.y < -0.5 || p.y > 2) throw new Error('y(' + p.t + ')=' + p.y + ' out of range');
     }
+});
+
+// ---- T65: Full Limb 3 pipeline ----
+TestRunner.register('Integration: Limb3 full pipeline', function() {
+    Limb3.onDataChange();
+    const res = Limb3.getResults();
+    if (!res) throw new Error('No Limb3 results');
+    if (res.sde.length !== 4) throw new Error('SDE: expected 4 regions');
+    if (!res.mfg.converged) throw new Error('MFG did not converge');
+    if (!res.hjb.policy) throw new Error('No HJB policy');
+    if (res.network.trajectories.length !== 4) throw new Error('Network: expected 4 regions');
+    if (res.pareto.paretoFront.length === 0) throw new Error('Empty Pareto front');
 });
 </script>
 
