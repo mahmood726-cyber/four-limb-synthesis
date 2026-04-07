@@ -3418,6 +3418,553 @@ const Limb3 = (() => {
         };
     };
 
+    // M21: Hamilton-Jacobi-Bellman Optimal Control
+    // Simplified 1D: state = adoption level, control = adoption intensity
+    methods.hjbControl = function(options) {
+        options = options ?? {};
+        var benefit = options.benefit ?? 0.8;
+        var cost = options.cost ?? 100;
+        var sigma = options.sigma ?? 0.15;
+        var r = options.r ?? 0.05;
+        var T = options.T ?? 10;
+        var nGrid = options.nGrid ?? 30;
+        var dt = options.dt ?? 0.5;
+
+        // State grid: adoption level in [0, 0.8]
+        var dx = 0.8 / (nGrid - 1);
+        var xGrid = Array.from({length: nGrid}, function(_, i) { return i * dx; });
+        var nTime = Math.ceil(T / dt);
+
+        // Value function V[t][x] and policy a[t][x]
+        var V = Array.from({length: nTime + 1}, function() { return new Float64Array(nGrid); });
+        var policy = Array.from({length: nTime + 1}, function() { return new Float64Array(nGrid); });
+
+        // Terminal condition: V(T, x) = 0
+        // Backward induction
+        for (var n = nTime - 1; n >= 0; n--) {
+            for (var i = 0; i < nGrid; i++) {
+                var x = xGrid[i];
+                var bestV = -Infinity, bestA = 0;
+
+                // Try different adoption intensities
+                for (var aIdx = 0; aIdx <= 10; aIdx++) {
+                    var a = aIdx / 10 * 0.8; // a ∈ [0, 0.8]
+
+                    // Instantaneous payoff: benefit*a*(1-x) - cost*a²
+                    var payoff = benefit * a * (1 - x) - (cost / 1000) * a * a;
+
+                    // Transition: x' = x + a*dt (simplified)
+                    var xNext = Math.max(0, Math.min(0.8, x + a * dt * 0.1));
+                    var iNext = Math.min(nGrid - 1, Math.round(xNext / dx));
+
+                    // Bellman equation
+                    var continuation = Math.exp(-r * dt) * V[n + 1][iNext];
+
+                    // Add volatility penalty
+                    var volPenalty = 0.5 * sigma * sigma * x * x * dt;
+
+                    var totalV = payoff * dt + continuation - volPenalty;
+                    if (totalV > bestV) { bestV = totalV; bestA = a; }
+                }
+
+                V[n][i] = bestV;
+                policy[n][i] = bestA;
+            }
+        }
+
+        return {
+            policy: Array.from(policy[0]), // Policy at t=0
+            valueFunction: Array.from(V[0]),
+            xGrid: xGrid, nTime: nTime,
+            // Optimal adoption at current state x=0.1
+            optimalAdoption: policy[0][Math.round(0.1 / dx)]
+        };
+    };
+
+    // M22: Regime-Switching HMM
+    // K=3 states: Normal, Crisis, Reform
+    methods.hmmDecode = function(observations, K) {
+        K = K ?? 3;
+        var T = observations.length;
+        var stateNames = ['Normal', 'Crisis', 'Reform'];
+
+        // Emission parameters per state: mean and std of health_exp/readiness proxy
+        var emissionMean = [0.5, 0.2, 0.8]; // Normal, Crisis, Reform
+        var emissionStd = [0.2, 0.3, 0.15];
+
+        // Transition matrix (row = from, col = to)
+        var A = [
+            [0.8, 0.15, 0.05], // Normal → ...
+            [0.2, 0.6, 0.2],   // Crisis → ...
+            [0.1, 0.05, 0.85]  // Reform → ...
+        ];
+
+        // Initial probabilities
+        var pi = [0.6, 0.2, 0.2];
+
+        // Viterbi algorithm
+        var delta = Array.from({length: T}, function() { return new Float64Array(K); });
+        var psi = Array.from({length: T}, function() { return new Int32Array(K); });
+
+        // Initialization
+        for (var k = 0; k < K; k++) {
+            delta[0][k] = Math.log(pi[k]) + MathCore.stats.normalLogPdf(observations[0], emissionMean[k], emissionStd[k]);
+        }
+
+        // Recursion
+        for (var t = 1; t < T; t++) {
+            for (var j = 0; j < K; j++) {
+                var bestVal = -Infinity, bestPrev = 0;
+                for (var ii = 0; ii < K; ii++) {
+                    var val = delta[t-1][ii] + Math.log(A[ii][j]);
+                    if (val > bestVal) { bestVal = val; bestPrev = ii; }
+                }
+                delta[t][j] = bestVal + MathCore.stats.normalLogPdf(observations[t], emissionMean[j], emissionStd[j]);
+                psi[t][j] = bestPrev;
+            }
+        }
+
+        // Backtracking
+        var states = new Int32Array(T);
+        var bestFinal = -Infinity;
+        for (var k2 = 0; k2 < K; k2++) {
+            if (delta[T-1][k2] > bestFinal) { bestFinal = delta[T-1][k2]; states[T-1] = k2; }
+        }
+        for (var t2 = T - 2; t2 >= 0; t2--) {
+            states[t2] = psi[t2+1][states[t2+1]];
+        }
+
+        // Forward algorithm for filtered probabilities
+        var alpha = Array.from({length: T}, function() { return new Float64Array(K); });
+        for (var k3 = 0; k3 < K; k3++) {
+            alpha[0][k3] = pi[k3] * MathCore.stats.normalPdf(observations[0], emissionMean[k3], emissionStd[k3]);
+        }
+        for (var tf = 1; tf < T; tf++) {
+            for (var jf = 0; jf < K; jf++) {
+                var sum = 0;
+                for (var iff = 0; iff < K; iff++) sum += alpha[tf-1][iff] * A[iff][jf];
+                alpha[tf][jf] = sum * MathCore.stats.normalPdf(observations[tf], emissionMean[jf], emissionStd[jf]);
+            }
+            // Normalize
+            var norm = alpha[tf].reduce(function(a, b) { return a + b; }, 0);
+            if (norm > 0) { for (var kn = 0; kn < K; kn++) alpha[tf][kn] /= norm; }
+        }
+
+        return {
+            states: Array.from(states),
+            stateNames: stateNames,
+            filteredProbs: alpha,
+            transitionMatrix: A,
+            emissionMean: emissionMean, emissionStd: emissionStd,
+            logLikelihood: bestFinal
+        };
+    };
+
+    // M23: Network Diffusion via Graph Laplacian
+    methods.networkDiffusion = function(contextRows, options) {
+        options = options ?? {};
+        var tMax = options.tMax ?? 10;
+        var dt = options.dt ?? 0.1;
+        var alpha = options.alpha ?? 0.1;
+        var pBase = options.pBase ?? 0.03;
+        var qBase = options.qBase ?? 0.38;
+        var R = contextRows.length;
+
+        // Weight matrix: trade/proximity proxy (inverse of health expenditure gap)
+        var W = MathCore.linalg.zeros(R, R);
+        for (var i = 0; i < R; i++) {
+            for (var j = i + 1; j < R; j++) {
+                var gap = Math.abs(contextRows[i].health_exp_per_capita - contextRows[j].health_exp_per_capita);
+                var weight = 1 / (1 + gap / 1000); // Inverse distance
+                MathCore.linalg.set(W, i, j, weight);
+                MathCore.linalg.set(W, j, i, weight);
+            }
+        }
+
+        // Graph Laplacian: L = D - W
+        var L = MathCore.linalg.zeros(R, R);
+        for (var li = 0; li < R; li++) {
+            var degSum = 0;
+            for (var lj = 0; lj < R; lj++) {
+                if (li !== lj) {
+                    var w = MathCore.linalg.get(W, li, lj);
+                    MathCore.linalg.set(L, li, lj, -w);
+                    degSum += w;
+                }
+            }
+            MathCore.linalg.set(L, li, li, degSum);
+        }
+
+        // Eigendecomposition of Laplacian
+        var eigResult = MathCore.linalg.eigenSymmetric(L);
+
+        // Diffusion + local Bass dynamics: du/dt = -α L u + f(u)
+        var nSteps = Math.ceil(tMax / dt);
+        var trajectories = contextRows.map(function() { return []; });
+        var u = contextRows.map(function() { return 0.01; }); // Initial adoption
+
+        for (var step = 0; step <= nSteps; step++) {
+            var t = step * dt;
+            for (var ri = 0; ri < R; ri++) trajectories[ri].push({t: t, y: u[ri]});
+
+            if (step === nSteps) break;
+
+            // Compute du/dt
+            var dudt = new Float64Array(R);
+            for (var di = 0; di < R; di++) {
+                // Diffusion: -α * (L * u)_i
+                var diffusion = 0;
+                for (var dj = 0; dj < R; dj++) diffusion += MathCore.linalg.get(L, di, dj) * u[dj];
+                dudt[di] -= alpha * diffusion;
+
+                // Local Bass dynamics
+                var bp = bassParams(contextRows[di], pBase, qBase);
+                var p = bp.p, q = bp.q, m = bp.m;
+                var ui = Math.max(0, Math.min(m, u[di]));
+                dudt[di] += p * (m - ui) + q * ui * (m - ui) / m;
+            }
+
+            // Euler step
+            for (var ei = 0; ei < R; ei++) {
+                u[ei] = Math.max(0, Math.min(0.8, u[ei] + dudt[ei] * dt));
+            }
+        }
+
+        return {
+            trajectories: contextRows.map(function(ctx, i) {
+                return { region: ctx.region, path: trajectories[i] };
+            }),
+            weightMatrix: W,
+            laplacian: L,
+            laplacianEigenvalues: Array.from(eigResult.values).sort(function(a, b) { return a - b; })
+        };
+    };
+
+    // M24: Real Options Analysis
+    // NPV* = (β/(β-1)) × I where β involves the discount rate and volatility
+    methods.realOptions = function(options) {
+        options = options ?? {};
+        var benefit = options.benefit ?? 500;
+        var cost = options.cost ?? 1000;
+        var sigma = options.sigma ?? 0.3;
+        var r = options.r ?? 0.05;
+        var delta = options.delta ?? 0.02;
+
+        // Naive NPV threshold: adopt when benefit > cost → threshold = cost
+        var naiveThreshold = cost;
+
+        // Real options β parameter
+        var halfMinusDrift = 0.5 - (r - delta) / (sigma * sigma);
+        var discriminant = halfMinusDrift * halfMinusDrift + 2 * r / (sigma * sigma);
+        var beta = halfMinusDrift + Math.sqrt(discriminant);
+
+        // Option threshold: adopt when benefit > NPV*
+        var optionThreshold = (beta / (beta - 1)) * cost;
+
+        // Option value at current benefit level
+        var optionValue = beta > 1
+            ? (benefit < optionThreshold
+                ? Math.pow(benefit / optionThreshold, beta) * (optionThreshold - cost)
+                : benefit - cost)
+            : Math.max(0, benefit - cost);
+
+        // Waiting premium (% above naive threshold)
+        var waitingPremium = (optionThreshold / naiveThreshold - 1) * 100;
+
+        return {
+            naiveThreshold: naiveThreshold,
+            optionThreshold: optionThreshold,
+            beta: beta,
+            optionValue: optionValue,
+            waitingPremium: waitingPremium,
+            shouldAdoptNow: benefit >= optionThreshold,
+            shouldAdoptNaive: benefit >= naiveThreshold
+        };
+    };
+
+    // M25: Neural ODE
+    // Tiny MLP that parameterizes du/dt = NN(u, t)
+    methods.neuralODE = function(targetData, options) {
+        options = options ?? {};
+        var epochs = options.epochs ?? 200;
+        var lr = options.lr ?? 0.01;
+        var hiddenSize = options.hiddenSize ?? 16;
+        var seed = options.seed ?? 42;
+        MathCore.random.seed(seed);
+        var inputSize = 2; // [u, t/10]
+        var outputSize = 1; // du/dt
+
+        // Initialize weights (Xavier)
+        var W1 = Array.from({length: hiddenSize}, function() {
+            return Array.from({length: inputSize}, function() {
+                return MathCore.random.normal(0, Math.sqrt(2 / inputSize));
+            });
+        });
+        var b1 = new Float64Array(hiddenSize);
+        var W2 = Array.from({length: outputSize}, function() {
+            return Array.from({length: hiddenSize}, function() {
+                return MathCore.random.normal(0, Math.sqrt(2 / hiddenSize));
+            });
+        });
+        var b2 = new Float64Array(outputSize);
+
+        // Forward pass through MLP
+        function mlpForward(u, t) {
+            var input = [u, t / 10]; // Normalize t
+            // Hidden layer with tanh
+            var hidden = new Float64Array(hiddenSize);
+            for (var h = 0; h < hiddenSize; h++) {
+                var s = b1[h];
+                for (var inp = 0; inp < inputSize; inp++) s += W1[h][inp] * input[inp];
+                hidden[h] = Math.tanh(s);
+            }
+            // Output layer
+            var output = b2[0];
+            for (var ho = 0; ho < hiddenSize; ho++) output += W2[0][ho] * hidden[ho];
+            return output;
+        }
+
+        // Integrate ODE using RK4
+        function integrate(y0, tStart, tEnd) {
+            return MathCore.ode.rk4(function(_t, y) { return mlpForward(y, _t); }, y0, tStart, tEnd, 0.1);
+        }
+
+        // Compute MSE loss against target
+        function computeLoss(predicted) {
+            var loss = 0;
+            for (var ti = 0; ti < targetData.length; ti++) {
+                var tgt = targetData[ti];
+                var closest = predicted[0];
+                for (var pi2 = 0; pi2 < predicted.length; pi2++) {
+                    if (Math.abs(predicted[pi2].t - tgt.t) < Math.abs(closest.t - tgt.t)) closest = predicted[pi2];
+                }
+                loss += (closest.y - tgt.y) * (closest.y - tgt.y);
+            }
+            return loss / targetData.length;
+        }
+
+        // Training loop (simple finite differences for gradients)
+        var y0 = targetData[0].y;
+        var tStart = targetData[0].t;
+        var tEnd = targetData[targetData.length - 1].t;
+        var initialLoss = Infinity, finalLoss = 0;
+        var eps = 1e-4;
+
+        for (var epoch = 0; epoch < epochs; epoch++) {
+            // Forward: integrate
+            var predicted = integrate(y0, tStart, tEnd);
+            var loss = computeLoss(predicted);
+
+            if (epoch === 0) initialLoss = loss;
+            finalLoss = loss;
+
+            // Gradient step via finite differences on W1
+            for (var h = 0; h < hiddenSize; h++) {
+                for (var inp = 0; inp < inputSize; inp++) {
+                    W1[h][inp] += eps;
+                    var predPlus = integrate(y0, tStart, tEnd);
+                    var lossPlus = computeLoss(predPlus);
+                    var grad = (lossPlus - loss) / eps;
+                    W1[h][inp] -= eps + lr * grad;
+                }
+            }
+
+            // Gradient step via finite differences on W2
+            for (var ho = 0; ho < hiddenSize; ho++) {
+                W2[0][ho] += eps;
+                var predPlus2 = integrate(y0, tStart, tEnd);
+                var lossPlus2 = computeLoss(predPlus2);
+                var grad2 = (lossPlus2 - loss) / eps;
+                W2[0][ho] -= eps + lr * grad2;
+            }
+        }
+
+        var predictedPath = integrate(y0, tStart, tEnd);
+
+        return {
+            predictedPath: predictedPath,
+            targetData: targetData,
+            initialLoss: initialLoss, finalLoss: finalLoss,
+            epochs: epochs,
+            weights: {W1: W1, b1: b1, W2: W2, b2: b2}
+        };
+    };
+
+    // M26: Multi-Objective Pareto Optimization (NSGA-II)
+    methods.paretoOptimize = function(contextRows, options) {
+        options = options ?? {};
+        var popSize = options.popSize ?? 50;
+        var generations = options.generations ?? 100;
+        var seed = options.seed ?? 42;
+        MathCore.random.seed(seed);
+        var R = contextRows.length;
+
+        // Individual: adoption vector a ∈ [0, 0.8]^R
+        function randomIndividual() {
+            return Array.from({length: R}, function() { return MathCore.random.uniform() * 0.8; });
+        }
+
+        // Evaluate 3 objectives: benefit (max), cost (min), equity (max = low Gini)
+        function evaluate(a) {
+            var totalBenefit = 0, totalCost = 0;
+            var benefits = [];
+            for (var i = 0; i < R; i++) {
+                var ctx = contextRows[i];
+                var pop = ctx.population_millions * 1e6;
+                var rate = ctx.mi_prevalence_per_100k / 100000;
+                var eligible = pop * rate * 0.05;
+                var treated = eligible * a[i];
+                var regionBenefit = treated * 0.01; // Simplified ARR
+                var regionCost = treated * ctx.treatment_cost_usd;
+                benefits.push(regionBenefit / (pop / 1e6)); // Per-million benefit
+                totalBenefit += regionBenefit;
+                totalCost += regionCost;
+            }
+
+            // Gini coefficient for equity
+            var sorted = benefits.slice().sort(function(x, y) { return x - y; });
+            var n = sorted.length;
+            var giniNum = 0;
+            for (var gi = 0; gi < n; gi++) giniNum += (2 * (gi + 1) - n - 1) * sorted[gi];
+            var giniDen = n * sorted.reduce(function(x, y) { return x + y; }, 0);
+            var gini = giniDen > 0 ? giniNum / giniDen : 0;
+
+            return {
+                benefit: totalBenefit,
+                cost: totalCost,
+                equity: 1 - gini, // Higher = more equal
+                adoption: a.slice()
+            };
+        }
+
+        // Dominance check: does a dominate b?
+        function dominates(a, b) {
+            if (a.benefit < b.benefit) return false;
+            if (a.cost > b.cost) return false;
+            if (a.equity < b.equity) return false;
+            var better = false;
+            if (a.benefit > b.benefit) better = true;
+            if (a.cost < b.cost) better = true;
+            if (a.equity > b.equity) better = true;
+            return better;
+        }
+
+        // Non-dominated sorting
+        function nonDominatedSort(pop) {
+            var fronts = [[]];
+            var dominatedBy = pop.map(function() { return []; });
+            var dominationCount = new Int32Array(pop.length);
+
+            for (var i = 0; i < pop.length; i++) {
+                for (var j = i + 1; j < pop.length; j++) {
+                    if (dominates(pop[i], pop[j])) {
+                        dominatedBy[i].push(j);
+                        dominationCount[j]++;
+                    } else if (dominates(pop[j], pop[i])) {
+                        dominatedBy[j].push(i);
+                        dominationCount[i]++;
+                    }
+                }
+                if (dominationCount[i] === 0) fronts[0].push(i);
+            }
+
+            var fi = 0;
+            while (fronts[fi].length > 0) {
+                var nextFront = [];
+                for (var nfi = 0; nfi < fronts[fi].length; nfi++) {
+                    var ii = fronts[fi][nfi];
+                    for (var dbi = 0; dbi < dominatedBy[ii].length; dbi++) {
+                        var jj = dominatedBy[ii][dbi];
+                        dominationCount[jj]--;
+                        if (dominationCount[jj] === 0) nextFront.push(jj);
+                    }
+                }
+                fi++;
+                if (nextFront.length > 0) fronts.push(nextFront);
+                else break;
+            }
+
+            return fronts;
+        }
+
+        // Crowding distance
+        function crowdingDistance(front, pop) {
+            var n = front.length;
+            var dist = new Float64Array(n).fill(0);
+            var objectives = ['benefit', 'cost', 'equity'];
+
+            for (var oi = 0; oi < objectives.length; oi++) {
+                var obj = objectives[oi];
+                var sortedF = front.map(function(idx, i) { return {idx: idx, i: i, val: pop[idx][obj]}; });
+                sortedF.sort(function(a, b) { return a.val - b.val; });
+                dist[sortedF[0].i] = Infinity;
+                dist[sortedF[n - 1].i] = Infinity;
+                var range = sortedF[n-1].val - sortedF[0].val;
+                if (range > 0) {
+                    for (var k = 1; k < n - 1; k++) {
+                        dist[sortedF[k].i] += (sortedF[k+1].val - sortedF[k-1].val) / range;
+                    }
+                }
+            }
+            return dist;
+        }
+
+        // Initialize population
+        var pop = Array.from({length: popSize}, function() { return evaluate(randomIndividual()); });
+
+        // Evolution
+        for (var gen = 0; gen < generations; gen++) {
+            // Create offspring via crossover + mutation
+            var offspring = [];
+            for (var oi2 = 0; oi2 < popSize; oi2++) {
+                var p1 = pop[(MathCore.random.nextU32() % popSize) >>> 0];
+                var p2 = pop[(MathCore.random.nextU32() % popSize) >>> 0];
+                var child = p1.adoption.map(function(v, jj) {
+                    var c = MathCore.random.uniform() < 0.5 ? v : p2.adoption[jj];
+                    // Mutation
+                    if (MathCore.random.uniform() < 0.1) c += MathCore.random.normal(0, 0.05);
+                    return Math.max(0, Math.min(0.8, c));
+                });
+                offspring.push(evaluate(child));
+            }
+
+            // Combined population
+            var combined = pop.concat(offspring);
+            var fronts = nonDominatedSort(combined);
+
+            // Select best popSize individuals
+            var newPop = [];
+            for (var fi2 = 0; fi2 < fronts.length; fi2++) {
+                var front = fronts[fi2];
+                if (newPop.length + front.length <= popSize) {
+                    for (var fj = 0; fj < front.length; fj++) newPop.push(combined[front[fj]]);
+                } else {
+                    // Fill remaining with highest crowding distance
+                    var cd = crowdingDistance(front, combined);
+                    var sortedCD = front.map(function(idx, i) { return {idx: idx, cd: cd[i]}; });
+                    sortedCD.sort(function(a, b) { return b.cd - a.cd; });
+                    for (var si = 0; si < sortedCD.length; si++) {
+                        if (newPop.length >= popSize) break;
+                        newPop.push(combined[sortedCD[si].idx]);
+                    }
+                    break;
+                }
+            }
+            pop = newPop;
+        }
+
+        // Extract Pareto front (first front)
+        var finalFronts = nonDominatedSort(pop);
+        var paretoFront = finalFronts[0].map(function(i) { return pop[i]; });
+
+        return {
+            paretoFront: paretoFront,
+            allSolutions: pop,
+            generations: generations,
+            nParetoOptimal: paretoFront.length
+        };
+    };
+
     // Public API stubs (filled in Task 6)
     function init() {}
     function onDataChange() {}
@@ -4013,6 +4560,88 @@ TestRunner.register('M20: MFG Nash equilibrium', function() {
     if (res.iterations < 1) throw new Error('No iterations');
     for (const r of res.equilibrium) {
         if (r.adoption < 0 || r.adoption > 1) throw new Error('Adoption ' + r.adoption + ' out of range');
+    }
+});
+
+// ---- T58: HJB decision surface ----
+TestRunner.register('M21: HJB optimal control policy', function() {
+    const res = Limb3.methods.hjbControl({
+        benefit: 0.8, cost: 100, sigma: 0.15, r: 0.05, T: 10, nGrid: 20
+    });
+    if (!res.policy) throw new Error('No policy');
+    if (!res.valueFunction) throw new Error('No value function');
+    if (res.policy.length !== 20) throw new Error('Grid size ' + res.policy.length + ', expected 20');
+    // Optimal adoption should be higher when benefit is high (last element >= first)
+    if (res.policy[res.policy.length - 1] < res.policy[0] - 0.01) throw new Error('Policy should increase with benefit');
+});
+
+// ---- T59: HMM Viterbi decoding ----
+TestRunner.register('M22: HMM Viterbi decoding produces valid states', function() {
+    MathCore.random.seed(42);
+    const observations = [];
+    for (let t = 0; t < 20; t++) observations.push(0.5 + MathCore.random.normal(0, 0.3));
+    const res = Limb3.methods.hmmDecode(observations);
+    if (res.states.length !== 20) throw new Error('Expected 20 states, got ' + res.states.length);
+    if (!res.states.every(function(s) { return s >= 0 && s <= 2; })) throw new Error('States out of range');
+    if (!res.transitionMatrix) throw new Error('No transition matrix');
+});
+
+// ---- T60: Network diffusion ----
+TestRunner.register('M23: Network diffusion on 4 regions', function() {
+    const ctx = DataLayer.getContext().filter(function(c) { return c.year === 2025; });
+    const res = Limb3.methods.networkDiffusion(ctx, {tMax: 10, dt: 0.1, alpha: 0.1});
+    if (res.trajectories.length !== 4) throw new Error('Expected 4, got ' + res.trajectories.length);
+    if (!res.laplacianEigenvalues) throw new Error('No eigenvalues');
+    // Fiedler value (2nd smallest eigenvalue) should be > 0 for connected graph
+    if (res.laplacianEigenvalues[1] <= -0.01) throw new Error('Fiedler = ' + res.laplacianEigenvalues[1]);
+});
+
+// ---- T61: Real options threshold > naive NPV threshold ----
+TestRunner.register('M24: Real options threshold > naive NPV', function() {
+    const res = Limb3.methods.realOptions({
+        benefit: 500, cost: 1000, sigma: 0.3, r: 0.05, delta: 0.02
+    });
+    if (res.optionThreshold <= res.naiveThreshold) throw new Error(
+        'Option ' + res.optionThreshold + ' should exceed naive ' + res.naiveThreshold
+    );
+    if (res.optionValue < 0) throw new Error('Option value should be non-negative');
+});
+
+// ---- T62: Neural ODE trains and predicts ----
+TestRunner.register('M25: Neural ODE training reduces loss', function() {
+    MathCore.random.seed(42);
+    // Generate training data from Bass model
+    const target = [];
+    for (let t = 0; t <= 10; t += 0.5) {
+        const y = 0.8 * (1 - Math.exp(-0.4 * t)) / (1 + 12 * Math.exp(-0.4 * t));
+        target.push({t: t, y: y});
+    }
+    const res = Limb3.methods.neuralODE(target, {epochs: 100, hiddenSize: 16, seed: 42});
+    if (res.finalLoss >= res.initialLoss) throw new Error('Loss did not decrease: ' + res.initialLoss + ' → ' + res.finalLoss);
+    if (!res.predictedPath) throw new Error('No predicted path');
+});
+
+// ---- T63: NSGA-II Pareto front ----
+TestRunner.register('M26: NSGA-II produces Pareto front', function() {
+    MathCore.random.seed(42);
+    const ctx = DataLayer.getContext().filter(function(c) { return c.year === 2025; });
+    const res = Limb3.methods.paretoOptimize(ctx, {popSize: 30, generations: 50, seed: 42});
+    if (!res.paretoFront || res.paretoFront.length === 0) throw new Error('Empty Pareto front');
+    // Pareto front should have benefit, cost, equity for each solution
+    const sol = res.paretoFront[0];
+    if (typeof sol.benefit !== 'number') throw new Error('Missing benefit');
+    if (typeof sol.cost !== 'number') throw new Error('Missing cost');
+    if (typeof sol.equity !== 'number') throw new Error('Missing equity');
+});
+
+// ---- T64: Neural ODE predicted path in valid range ----
+TestRunner.register('M25: Neural ODE prediction in [-0.5, 2]', function() {
+    MathCore.random.seed(42);
+    const target = [];
+    for (let t = 0; t <= 5; t += 1) target.push({t: t, y: 0.3 + t * 0.05});
+    const res = Limb3.methods.neuralODE(target, {epochs: 50, hiddenSize: 8, seed: 42});
+    for (const p of res.predictedPath) {
+        if (p.y < -0.5 || p.y > 2) throw new Error('y(' + p.t + ')=' + p.y + ' out of range');
     }
 });
 </script>
