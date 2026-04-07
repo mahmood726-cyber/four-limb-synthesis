@@ -914,6 +914,280 @@ document.addEventListener('DOMContentLoaded', function() { App.init(); });
 </script>
 
 <!-- ============================================================
+     SCRIPT 4b: Limb1 — Trial Efficacy & Evidence Geometry (M1-M5)
+     ============================================================ -->
+<script>
+/* === LIMB 1: TRIAL EFFICACY & EVIDENCE GEOMETRY === */
+const Limb1 = (() => {
+    const methods = {};
+
+    // M1: REML tau² estimator
+    methods.reml = function(yi, vi, {maxIter = 100, tol = 1e-8} = {}) {
+        const k = yi.length;
+        if (k < 2) return { tau2: 0, mu: yi[0] ?? 0, se: Math.sqrt(vi[0] ?? 1) };
+
+        // DerSimonian-Laird initial estimate
+        const wFixed = vi.map(v => 1 / v);
+        const sumW = wFixed.reduce((a, b) => a + b, 0);
+        const muFixed = yi.reduce((s, y, i) => s + wFixed[i] * y, 0) / sumW;
+        let Q = 0;
+        for (let i = 0; i < k; i++) Q += wFixed[i] * (yi[i] - muFixed) ** 2;
+        const c = sumW - wFixed.reduce((s, w) => s + w * w, 0) / sumW;
+        let tau2 = Math.max(0, (Q - (k - 1)) / c);
+
+        // Newton-Raphson on REML likelihood
+        for (let iter = 0; iter < maxIter; iter++) {
+            const w = vi.map(v => 1 / (v + tau2));
+            const sumW2 = w.reduce((a, b) => a + b, 0);
+            const mu = w.reduce((s, wi, i) => s + wi * yi[i], 0) / sumW2;
+
+            // First derivative of REML log-likelihood w.r.t. tau²
+            let dl = 0, d2l = 0;
+            for (let i = 0; i < k; i++) {
+                const wi2 = w[i] * w[i];
+                dl += -0.5 * w[i] + 0.5 * wi2 * (yi[i] - mu) ** 2 + 0.5 * wi2 / sumW2;
+                d2l += 0.5 * wi2 - wi2 * w[i] * (yi[i] - mu) ** 2 - wi2 * w[i] / sumW2;
+            }
+
+            // KKT boundary condition: if at tau2=0 and gradient points toward negative, we're done
+            if (tau2 === 0 && dl <= 0) break;
+
+            if (Math.abs(d2l) < 1e-30) break;
+            const rawStep = dl / d2l;
+            const newTau2 = tau2 - rawStep;
+            tau2 = Math.max(0, newTau2);
+            if (Math.abs(rawStep) < tol) break;
+        }
+
+        const w = vi.map(v => 1 / (v + tau2));
+        const sumWf = w.reduce((a, b) => a + b, 0);
+        const mu = w.reduce((s, wi, i) => s + wi * yi[i], 0) / sumWf;
+        const se = Math.sqrt(1 / sumWf);
+        const I2 = Math.max(0, (Q - (k - 1)) / Q) * 100;
+
+        return { tau2, mu, se, I2, Q, k, weights: w };
+    };
+
+    // M2: Knapp-Hartung adjustment
+    methods.knappHartung = function(yi, vi, tau2, mu) {
+        const k = yi.length;
+        const w = vi.map(v => 1 / (v + tau2));
+        const sumW = w.reduce((a, b) => a + b, 0);
+        const qKH = w.reduce((s, wi, i) => s + wi * (yi[i] - mu) ** 2, 0) / (k - 1);
+        const seKH = Math.sqrt(qKH / sumW);
+        const tCrit = MathCore.stats.tQuantile(0.975, k - 1);
+        return {
+            mu, se: seKH,
+            ci_lower: mu - tCrit * seKH,
+            ci_upper: mu + tCrit * seKH,
+            q_kh: qKH, df: k - 1
+        };
+    };
+
+    // M3: Prediction interval
+    methods.predictionInterval = function(yi, vi, tau2, mu, se) {
+        const k = yi.length;
+        if (k < 3) return { lower: -Infinity, upper: Infinity, df: 0 };
+        const tCrit = MathCore.stats.tQuantile(0.975, k - 2);
+        const piSe = Math.sqrt(tau2 + se * se);
+        return {
+            lower: mu - tCrit * piSe,
+            upper: mu + tCrit * piSe,
+            df: k - 2
+        };
+    };
+
+    // M4: Bayesian NMA via Metropolis-within-Gibbs
+    methods.mcmcNMA = function(trials, {warmup = 2000, samples = 3000, chains = 2, seed = 42} = {}) {
+        const d01 = trials.filter(t => t.t1 === 0 && t.t2 === 1);
+        const d02 = trials.filter(t => t.t1 === 0 && t.t2 === 2);
+        const d12 = trials.filter(t => t.t1 === 1 && t.t2 === 2);
+
+        function logLikelihood(mu1, mu2, tau2) {
+            let ll = 0;
+            for (const t of d01) ll += MathCore.stats.normalLogPdf(t.yi, mu1, Math.sqrt(t.vi + tau2));
+            for (const t of d02) ll += MathCore.stats.normalLogPdf(t.yi, mu2, Math.sqrt(t.vi + tau2));
+            for (const t of d12) ll += MathCore.stats.normalLogPdf(t.yi, mu2 - mu1, Math.sqrt(t.vi + tau2));
+            return ll;
+        }
+
+        const allChains = [];
+
+        for (let c = 0; c < chains; c++) {
+            MathCore.random.seed(seed + c * 1000);
+            let mu1 = MathCore.random.normal(-0.3, 0.5);
+            let mu2 = MathCore.random.normal(-0.3, 0.5);
+            let tau2 = 0.05;
+            const chainSamples = [];
+
+            const totalIter = warmup + samples;
+            for (let iter = 0; iter < totalIter; iter++) {
+                // Metropolis step for mu1
+                const mu1_prop = mu1 + MathCore.random.normal(0, 0.05);
+                const ll_curr = logLikelihood(mu1, mu2, tau2);
+                const ll_prop = logLikelihood(mu1_prop, mu2, tau2);
+                if (Math.log(MathCore.random.uniform()) < ll_prop - ll_curr) mu1 = mu1_prop;
+
+                // Metropolis step for mu2
+                const mu2_prop = mu2 + MathCore.random.normal(0, 0.05);
+                const ll_curr2 = logLikelihood(mu1, mu2, tau2);
+                const ll_prop2 = logLikelihood(mu1, mu2_prop, tau2);
+                if (Math.log(MathCore.random.uniform()) < ll_prop2 - ll_curr2) mu2 = mu2_prop;
+
+                // Gibbs step for tau2 (InvGamma full conditional)
+                const a_post = 0.01 + trials.length / 2;
+                let ss = 0;
+                for (const t of d01) ss += (t.yi - mu1) ** 2 / 2;
+                for (const t of d02) ss += (t.yi - mu2) ** 2 / 2;
+                for (const t of d12) ss += (t.yi - (mu2 - mu1)) ** 2 / 2;
+                tau2 = Math.max(1e-6, MathCore.random.invGamma(a_post, 0.01 + ss));
+
+                if (iter >= warmup) chainSamples.push({mu1, mu2, tau2});
+            }
+            allChains.push(chainSamples);
+        }
+
+        // Compute posterior summaries
+        const allMu1 = allChains.flat().map(s => s.mu1);
+        const allMu2 = allChains.flat().map(s => s.mu2);
+        const allTau2 = allChains.flat().map(s => s.tau2);
+
+        const mu1_mean = MathCore.stats.mean(allMu1);
+        const mu2_mean = MathCore.stats.mean(allMu2);
+        const tau2_mean = MathCore.stats.mean(allTau2);
+
+        const mu1_sorted = Float64Array.from(allMu1).sort();
+        const mu2_sorted = Float64Array.from(allMu2).sort();
+        const n = mu1_sorted.length;
+        const lo = Math.floor(0.025 * n), hi = Math.floor(0.975 * n);
+
+        // Gelman-Rubin R-hat
+        function rhat(chainArrays) {
+            const m = chainArrays.length;
+            const ns = chainArrays.map(ch => ch.length);
+            const means = chainArrays.map(ch => MathCore.stats.mean(ch));
+            const n0 = ns[0];
+            const B = n0 * MathCore.stats.variance(means);
+            const W = MathCore.stats.mean(chainArrays.map(ch => MathCore.stats.variance(ch)));
+            if (W < 1e-20) return 1.0;
+            const varEst = ((n0 - 1) / n0) * W + (1 / n0) * B;
+            return Math.sqrt(varEst / W);
+        }
+
+        const rhat_mu1 = chains > 1 ? rhat(allChains.map(ch => ch.map(s => s.mu1))) : 1.0;
+
+        return {
+            mu1_mean, mu2_mean, tau2_mean,
+            mu1_ci: [mu1_sorted[lo], mu1_sorted[hi]],
+            mu2_ci: [mu2_sorted[lo], mu2_sorted[hi]],
+            rhat_mu1,
+            chains: allChains,
+            nSamples: n
+        };
+    };
+
+    // M5: Node-splitting inconsistency test
+    methods.nodeSplit = function(trials) {
+        const comparisons = new Set();
+        for (const t of trials) comparisons.add(`${t.t1}v${t.t2}`);
+
+        const results = [];
+
+        for (const comp of comparisons) {
+            const [a, b] = comp.split('v').map(Number);
+            // Direct evidence for a-b
+            const direct = trials.filter(t => t.t1 === a && t.t2 === b);
+            if (direct.length === 0) continue;
+
+            // Indirect evidence: a-c and c-b paths
+            const treatments = new Set(trials.flatMap(t => [t.t1, t.t2]));
+            let indirectEstimates = [];
+
+            for (const c of treatments) {
+                if (c === a || c === b) continue;
+                // a-c evidence
+                const ac = trials.filter(t => (t.t1 === a && t.t2 === c));
+                // c-b evidence
+                const cb = trials.filter(t => (t.t1 === c && t.t2 === b));
+                // Also check b-c (reversed)
+                const bc = trials.filter(t => (t.t1 === Math.min(b,c) && t.t2 === Math.max(b,c)));
+
+                if (ac.length > 0 && (cb.length > 0 || bc.length > 0)) {
+                    const acYi = ac.map(t => t.yi), acVi = ac.map(t => t.vi);
+                    const acPool = MathCore.stats.mean(acYi);
+                    const acSe = Math.sqrt(acVi.reduce((s,v) => s + 1/v, 0));
+                    const acPoolSe = 1 / acSe;
+
+                    let cbPool, cbPoolSe;
+                    if (cb.length > 0) {
+                        const cbYi = cb.map(t => t.yi), cbVi = cb.map(t => t.vi);
+                        cbPool = MathCore.stats.mean(cbYi);
+                        cbPoolSe = 1 / Math.sqrt(cbVi.reduce((s,v) => s + 1/v, 0));
+                    } else {
+                        // Use b-c reversed: d_cb = -d_bc
+                        const bcYi = bc.map(t => -t.yi), bcVi = bc.map(t => t.vi);
+                        cbPool = MathCore.stats.mean(bcYi);
+                        cbPoolSe = 1 / Math.sqrt(bcVi.reduce((s,v) => s + 1/v, 0));
+                    }
+
+                    // Indirect: d_ab = d_ac + d_cb
+                    const indirectEst = acPool + cbPool;
+                    const indirectSe = Math.sqrt(acPoolSe**2 + cbPoolSe**2);
+                    indirectEstimates.push({estimate: indirectEst, se: indirectSe});
+                }
+            }
+
+            if (indirectEstimates.length === 0) {
+                results.push({comparison: comp, direct_only: true, inconsistent: false});
+                continue;
+            }
+
+            // Pool direct
+            const dYi = direct.map(t => t.yi), dVi = direct.map(t => t.vi);
+            const dW = dVi.map(v => 1/v);
+            const dSumW = dW.reduce((a,bv) => a+bv, 0);
+            const directEst = dW.reduce((s,w,i) => s + w * dYi[i], 0) / dSumW;
+            const directSe = Math.sqrt(1 / dSumW);
+
+            // Pool indirect estimates
+            const indW = indirectEstimates.map(e => 1/(e.se*e.se));
+            const indSumW = indW.reduce((a,bv) => a+bv, 0);
+            const indirectPool = indW.reduce((s,w,i) => s + w * indirectEstimates[i].estimate, 0) / indSumW;
+            const indirectSe = Math.sqrt(1 / indSumW);
+
+            // Difference
+            const diff = directEst - indirectPool;
+            const diffSe = Math.sqrt(directSe**2 + indirectSe**2);
+            const z = diff / diffSe;
+            const pValue = 2 * (1 - MathCore.stats.normalCdf(Math.abs(z)));
+
+            results.push({
+                comparison: comp,
+                direct: directEst, direct_se: directSe,
+                indirect: indirectPool, indirect_se: indirectSe,
+                difference: diff, diff_se: diffSe,
+                ci_lower: diff - 1.96 * diffSe,
+                ci_upper: diff + 1.96 * diffSe,
+                p_value: pValue,
+                inconsistent: pValue < 0.05
+            });
+        }
+
+        return results;
+    };
+
+    // Public API stubs (filled in later tasks)
+    function init() {}
+    function onDataChange(data) {}
+    function exportCSV() {}
+    function exportPNG() {}
+    function getResults() { return null; }
+
+    return { methods, init, onDataChange, exportCSV, exportPNG, getResults };
+})();
+</script>
+
+<!-- ============================================================
      SCRIPT 4: TestRunner + all 17 tests
      ============================================================ -->
 <script>
@@ -1075,6 +1349,84 @@ TestRunner.register('Synthetic NMA 1000 trials', function() {
     const d = DataLayer.load('nma_synthetic');
     if (d.trials.length !== 1000) throw new Error('Expected 1000, got ' + d.trials.length);
     if (d.format !== 'nma') throw new Error('Expected nma format, got ' + d.format);
+});
+
+// ---- T18: REML tau²≈0 for identical studies ----
+TestRunner.register('M1: REML tau2=0 for identical studies', function() {
+    const yi = [0.5, 0.5, 0.5, 0.5];
+    const vi = [0.1, 0.1, 0.1, 0.1];
+    const res = Limb1.methods.reml(yi, vi);
+    if (res.tau2 > 0.01) throw new Error('tau2 = ' + res.tau2 + ', expected ~0');
+});
+
+// ---- T19: REML pooled SGLT2 RR in [0.70, 0.85] ----
+TestRunner.register('M1: REML pooled SGLT2 RR', function() {
+    const d = DataLayer.load('sglt2');
+    const yi = d.trialsYiVi.map(function(t) { return t.yi; });
+    const vi = d.trialsYiVi.map(function(t) { return t.vi; });
+    const res = Limb1.methods.reml(yi, vi);
+    const rr = Math.exp(res.mu);
+    if (rr < 0.70 || rr > 0.85) throw new Error('Pooled RR = ' + rr + ', expected 0.70-0.85');
+});
+
+// ---- T20: KH CI wider than z-based CI (heterogeneous data) ----
+TestRunner.register('M2: KH CI wider than z-based', function() {
+    // Use data with real heterogeneity so tau2 > 0 and qKH > 1
+    const yi = [-0.10, -0.50, -0.20, -0.70];
+    const vi = [0.04, 0.04, 0.04, 0.04];
+    const reml = Limb1.methods.reml(yi, vi);
+    const kh = Limb1.methods.knappHartung(yi, vi, reml.tau2, reml.mu);
+    const zWidth = 2 * 1.96 * reml.se;
+    const khWidth = kh.ci_upper - kh.ci_lower;
+    if (khWidth <= zWidth) throw new Error('KH width ' + khWidth + ' should exceed z-width ' + zWidth);
+});
+
+// ---- T21: Prediction interval wider than CI ----
+TestRunner.register('M3: Prediction interval wider than CI', function() {
+    const yi = [-0.26, -0.29, -0.24, -0.20];
+    const vi = [0.01, 0.02, 0.01, 0.015];
+    const reml = Limb1.methods.reml(yi, vi);
+    const pi = Limb1.methods.predictionInterval(yi, vi, reml.tau2, reml.mu, reml.se);
+    const ciWidth = 2 * 1.96 * reml.se;
+    const piWidth = pi.upper - pi.lower;
+    if (piWidth <= ciWidth) throw new Error('PI width ' + piWidth + ' should exceed CI width ' + ciWidth);
+});
+
+// ---- T22: MCMC NMA recovers known effect (synthetic data) ----
+TestRunner.register('M4: MCMC NMA mu1 ~ -0.3', function() {
+    MathCore.random.seed(42);
+    const trials = [];
+    for (let i = 0; i < 30; i++) {
+        trials.push({t1:0, t2:1, yi: -0.3 + MathCore.random.normal(0, 0.1), vi: 0.05});
+    }
+    for (let i = 0; i < 30; i++) {
+        trials.push({t1:0, t2:2, yi: -0.4 + MathCore.random.normal(0, 0.1), vi: 0.05});
+    }
+    const res = Limb1.methods.mcmcNMA(trials, {warmup:1000, samples:2000, chains:1, seed:42});
+    if (Math.abs(res.mu1_mean - (-0.3)) > 0.15) throw new Error('mu1=' + res.mu1_mean + ', expected ~-0.3');
+    if (Math.abs(res.mu2_mean - (-0.4)) > 0.15) throw new Error('mu2=' + res.mu2_mean + ', expected ~-0.4');
+});
+
+// ---- T23: MCMC R-hat < 1.1 on well-behaved data ----
+TestRunner.register('M4: MCMC Rhat < 1.1', function() {
+    MathCore.random.seed(99);
+    const trials = [];
+    for (let i = 0; i < 20; i++) trials.push({t1:0, t2:1, yi: -0.25 + MathCore.random.normal(0, 0.08), vi: 0.04});
+    for (let i = 0; i < 20; i++) trials.push({t1:0, t2:2, yi: -0.35 + MathCore.random.normal(0, 0.08), vi: 0.04});
+    const res = Limb1.methods.mcmcNMA(trials, {warmup:1000, samples:1000, chains:2, seed:99});
+    if (res.rhat_mu1 > 1.1) throw new Error('Rhat = ' + res.rhat_mu1);
+});
+
+// ---- T24: Node-split no false inconsistency on consistent data ----
+TestRunner.register('M5: Node-split no inconsistency on consistent data', function() {
+    MathCore.random.seed(55);
+    const trials = [];
+    for (let i = 0; i < 15; i++) trials.push({t1:0, t2:1, yi: -0.3 + MathCore.random.normal(0, 0.1), vi: 0.05});
+    for (let i = 0; i < 15; i++) trials.push({t1:0, t2:2, yi: -0.4 + MathCore.random.normal(0, 0.1), vi: 0.05});
+    for (let i = 0; i < 10; i++) trials.push({t1:1, t2:2, yi: -0.1 + MathCore.random.normal(0, 0.1), vi: 0.05});
+    const res = Limb1.methods.nodeSplit(trials);
+    const comp12 = res.find(function(r) { return r.comparison === '1v2'; });
+    if (comp12 && comp12.inconsistent) throw new Error('False inconsistency detected');
 });
 </script>
 
