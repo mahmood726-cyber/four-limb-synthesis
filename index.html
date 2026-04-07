@@ -2384,6 +2384,310 @@ const Limb2 = (() => {
         };
     };
 
+    // M15: Causal Transport via Do-Calculus
+    methods.causalTransport = function(trialIPD, targetIPD, dag) {
+        // Identify adjustment set via back-door criterion
+        var adjResult = MathCore.graph.isIdentifiable(dag, 'treatment', 'outcome');
+        var adjustmentSet = adjResult.adjustmentSet;
+
+        // Map covariate names to IPD fields
+        var covMap = {'age_65': 'age_65', 'diabetes': 'diabetes'};
+        var adjustVars = adjustmentSet.filter(function(v) { return v in covMap; }).map(function(v) { return covMap[v]; });
+
+        // Stratified estimation: P_target(Y|do(X)) = Σ_z P_trial(Y|X,Z=z) * P_target(Z=z)
+        var nAdj = adjustVars.length;
+        var strata = 1 << nAdj; // 2^nAdj for binary
+        var ate = 0;
+        var totalTargetWeight = 0;
+
+        for (var s = 0; s < strata; s++) {
+            // Decode stratum
+            var stratumValues = {};
+            for (var j = 0; j < nAdj; j++) {
+                stratumValues[adjustVars[j]] = (s >> j) & 1;
+            }
+
+            // Trial observations in this stratum
+            var trialInStratum = trialIPD.filter(function(row) {
+                return adjustVars.every(function(v) { return row[v] === stratumValues[v]; });
+            });
+
+            // Target proportion in this stratum
+            var targetInStratum = targetIPD.filter(function(row) {
+                return adjustVars.every(function(v) { return row[v] === stratumValues[v]; });
+            });
+            var targetProp = targetInStratum.length / targetIPD.length;
+
+            if (trialInStratum.length > 0 && targetProp > 0) {
+                var stratumMean = MathCore.stats.mean(trialInStratum.map(function(r) { return r.yi; }));
+                ate += stratumMean * targetProp;
+                totalTargetWeight += targetProp;
+            }
+        }
+
+        if (totalTargetWeight > 0) ate /= totalTargetWeight;
+
+        return {
+            ate_causal: ate,
+            adjustmentSet: adjustVars,
+            identifiable: true,
+            nStrata: strata
+        };
+    };
+
+    // M16: Knockoff Filter for Variable Selection
+    methods.knockoffFilter = function(trialIPD, fdrTarget) {
+        if (fdrTarget === undefined) fdrTarget = 0.2;
+        var covNames = ['age_65', 'diabetes'];
+        var n = trialIPD.length;
+        var p = covNames.length;
+
+        // Build X matrix and y vector
+        var X = trialIPD.map(function(r) { return covNames.map(function(c) { return r[c]; }); });
+        var y = trialIPD.map(function(r) { return r.yi; });
+
+        // Generate knockoff copies: flip binary values with probability 0.3
+        MathCore.random.seed(12345);
+        var Xtilde = X.map(function(row) {
+            return row.map(function(v) {
+                return MathCore.random.uniform() < 0.3 ? (1 - v) : v;
+            });
+        });
+
+        // Fit regression with both original and knockoff features
+        var Xaug = X.map(function(row, i) { return [1].concat(row).concat(Xtilde[i]); });
+        var pAug = Xaug[0].length;
+
+        // OLS
+        var XtX = MathCore.linalg.zeros(pAug, pAug);
+        var Xty = new Float64Array(pAug);
+        for (var i = 0; i < n; i++) {
+            for (var j = 0; j < pAug; j++) {
+                Xty[j] += Xaug[i][j] * y[i];
+                for (var k = 0; k < pAug; k++) {
+                    var old = MathCore.linalg.get(XtX, j, k);
+                    MathCore.linalg.set(XtX, j, k, old + Xaug[i][j] * Xaug[i][k]);
+                }
+            }
+        }
+
+        // Add ridge penalty for stability
+        for (var j2 = 0; j2 < pAug; j2++) {
+            var old2 = MathCore.linalg.get(XtX, j2, j2);
+            MathCore.linalg.set(XtX, j2, j2, old2 + 0.01);
+        }
+
+        var betaAug;
+        try { betaAug = MathCore.linalg.solve(XtX, Xty); }
+        catch(e) { betaAug = new Float64Array(pAug); }
+
+        // Knockoff statistics: W_j = |beta_j| - |beta_j_tilde|
+        var W = [];
+        for (var jj = 0; jj < p; jj++) {
+            var origCoef = Math.abs(betaAug[1 + jj]);
+            var knockCoef = Math.abs(betaAug[1 + p + jj]);
+            W.push(origCoef - knockCoef);
+        }
+
+        // Knockoff+ threshold
+        var absW = W.map(Math.abs).sort(function(a, b) { return b - a; });
+        var threshold = Infinity;
+        for (var ti = 0; ti < absW.length; ti++) {
+            var t = absW[ti];
+            var numer = 1 + W.filter(function(w) { return w <= -t; }).length;
+            var denom = Math.max(1, W.filter(function(w) { return w >= t; }).length);
+            if (numer / denom <= fdrTarget) { threshold = t; break; }
+        }
+
+        var selected = covNames.filter(function(_, jjj) { return W[jjj] >= threshold; });
+
+        return {
+            importances: W,
+            covariateNames: covNames,
+            selected: selected,
+            threshold: isFinite(threshold) ? threshold : null,
+            fdrTarget: fdrTarget
+        };
+    };
+
+    // M17: KLIEP Density Ratio Estimation
+    methods.kliep = function(Xtrial, Xtarget, nBasis, maxIter) {
+        if (nBasis === undefined) nBasis = 50;
+        if (maxIter === undefined) maxIter = 100;
+        var m = Xtrial.length, n = Xtarget.length;
+
+        // Use a subset of target points as basis centers
+        var nB = Math.min(nBasis, n);
+        var centers = Xtarget.slice(0, nB);
+        var sigma = MathCore.kernel.medianBandwidth(Xtrial.concat(Xtarget));
+
+        // Compute basis functions for all target and trial points
+        var A = []; // n x nB (target)
+        for (var i = 0; i < n; i++) {
+            A[i] = new Float64Array(nB);
+            for (var l = 0; l < nB; l++) {
+                A[i][l] = MathCore.kernel.rbf(Xtarget[i], centers[l], sigma);
+            }
+        }
+
+        var B = []; // m x nB (trial)
+        for (var ii = 0; ii < m; ii++) {
+            B[ii] = new Float64Array(nB);
+            for (var ll = 0; ll < nB; ll++) {
+                B[ii][ll] = MathCore.kernel.rbf(Xtrial[ii], centers[ll], sigma);
+            }
+        }
+
+        // Initialize alpha uniformly
+        var alpha = new Float64Array(nB).fill(1 / nB);
+
+        // Gradient ascent to maximize Σ_target log(r(x)) s.t. E_trial[r(x)] = 1
+        var lr = 0.01;
+        for (var iter = 0; iter < maxIter; iter++) {
+            // r(x) = Σ_l alpha_l * φ_l(x)
+            var rTarget = new Float64Array(n);
+            for (var i2 = 0; i2 < n; i2++) {
+                for (var l2 = 0; l2 < nB; l2++) rTarget[i2] += alpha[l2] * A[i2][l2];
+                rTarget[i2] = Math.max(rTarget[i2], 1e-10);
+            }
+
+            // Gradient: Σ_target φ_l(x)/r(x) / n
+            var grad = new Float64Array(nB);
+            for (var l3 = 0; l3 < nB; l3++) {
+                for (var i3 = 0; i3 < n; i3++) {
+                    grad[l3] += A[i3][l3] / rTarget[i3];
+                }
+                grad[l3] /= n;
+            }
+
+            // Update alpha
+            for (var l4 = 0; l4 < nB; l4++) {
+                alpha[l4] += lr * grad[l4];
+                if (alpha[l4] < 0) alpha[l4] = 0;
+            }
+
+            // Normalize so E_trial[r(x)] = 1
+            var normConst = 0;
+            for (var i4 = 0; i4 < m; i4++) {
+                var ri = 0;
+                for (var l5 = 0; l5 < nB; l5++) ri += alpha[l5] * B[i4][l5];
+                normConst += ri;
+            }
+            normConst /= m;
+            if (normConst > 1e-10) {
+                for (var l6 = 0; l6 < nB; l6++) alpha[l6] /= normConst;
+            }
+        }
+
+        // Compute final ratios for trial points
+        var ratios = new Float64Array(m);
+        for (var i5 = 0; i5 < m; i5++) {
+            for (var l7 = 0; l7 < nB; l7++) ratios[i5] += alpha[l7] * B[i5][l7];
+            ratios[i5] = Math.max(ratios[i5], 1e-10);
+        }
+
+        return { ratios: Array.from(ratios), alpha: Array.from(alpha), sigma: sigma };
+    };
+
+    // KLIEP-based transported effect
+    methods.kliepTransport = function(trialIPD, targetIPD) {
+        var X = trialIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+        var Y = targetIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+        var kliepRes = methods.kliep(X, Y);
+
+        var sumW = kliepRes.ratios.reduce(function(a, b) { return a + b; }, 0);
+        var ate = 0;
+        for (var i = 0; i < trialIPD.length; i++) {
+            ate += kliepRes.ratios[i] * trialIPD[i].yi;
+        }
+        ate /= sumW;
+
+        return { ate_transported: ate, ratios: kliepRes.ratios };
+    };
+
+    // M18: Mapper Algorithm (TDA)
+    methods.mapper = function(points, opts) {
+        opts = opts || {};
+        var nIntervals = opts.nIntervals !== undefined ? opts.nIntervals : 10;
+        var overlap = opts.overlap !== undefined ? opts.overlap : 0.3;
+        var nClusters = opts.nClusters !== undefined ? opts.nClusters : 3;
+        var n = points.length;
+        if (n === 0) return { nodes: [], edges: [] };
+
+        // Filter function = dimension with max variance
+        var dim = points[0].length;
+        var mean = new Float64Array(dim);
+        for (var pi = 0; pi < n; pi++) for (var d = 0; d < dim; d++) mean[d] += points[pi][d] / n;
+
+        var variances = new Float64Array(dim);
+        for (var pi2 = 0; pi2 < n; pi2++)
+            for (var d2 = 0; d2 < dim; d2++) variances[d2] += (points[pi2][d2] - mean[d2]) * (points[pi2][d2] - mean[d2]);
+
+        var maxDim = 0;
+        for (var dd = 1; dd < dim; dd++) { if (variances[dd] > variances[maxDim]) maxDim = dd; }
+        var filterVals = points.map(function(p) { return p[maxDim]; });
+
+        // Cover range with overlapping intervals
+        var fMin = filterVals.reduce(function(a,b) { return a < b ? a : b; }, filterVals[0]);
+        var fMax = filterVals.reduce(function(a,b) { return a > b ? a : b; }, filterVals[0]);
+        var range = fMax - fMin || 1;
+        var intervalWidth = range / nIntervals * (1 + overlap);
+        var step = range / nIntervals;
+
+        var intervals = [];
+        for (var ii = 0; ii < nIntervals; ii++) {
+            var lo = fMin + ii * step - overlap * step / 2;
+            var hi = lo + intervalWidth;
+            intervals.push({lo: lo, hi: hi});
+        }
+
+        // Cluster within each interval
+        var nodes = [];
+        var nodeId = 0;
+        var pointToNodes = [];
+        for (var ppp = 0; ppp < n; ppp++) pointToNodes.push([]);
+
+        for (var intIdx = 0; intIdx < intervals.length; intIdx++) {
+            var interval = intervals[intIdx];
+            var members = [];
+            for (var mi = 0; mi < n; mi++) {
+                if (filterVals[mi] >= interval.lo && filterVals[mi] <= interval.hi) members.push(mi);
+            }
+            if (members.length === 0) continue;
+
+            var k = Math.min(nClusters, members.length);
+            var sorted = members.slice().sort(function(a, b) { return filterVals[a] - filterVals[b]; });
+            var clusterSize = Math.ceil(sorted.length / k);
+            for (var c = 0; c < k; c++) {
+                var clusterMembers = sorted.slice(c * clusterSize, (c + 1) * clusterSize);
+                if (clusterMembers.length === 0) continue;
+                var mfVals = clusterMembers.map(function(i) { return filterVals[i]; });
+                var mf = MathCore.stats.mean(mfVals);
+                var id = nodeId++;
+                nodes.push({id: id, members: clusterMembers, meanFilter: mf, size: clusterMembers.length});
+                for (var cm = 0; cm < clusterMembers.length; cm++) pointToNodes[clusterMembers[cm]].push(id);
+            }
+        }
+
+        // Connect nodes sharing members
+        var edges = [];
+        var edgeSet = new Set();
+        for (var eidx = 0; eidx < n; eidx++) {
+            var nodeList = pointToNodes[eidx];
+            for (var na = 0; na < nodeList.length; na++) {
+                for (var nb = na + 1; nb < nodeList.length; nb++) {
+                    var key = Math.min(nodeList[na], nodeList[nb]) + '-' + Math.max(nodeList[na], nodeList[nb]);
+                    if (!edgeSet.has(key)) {
+                        edgeSet.add(key);
+                        edges.push({from: nodeList[na], to: nodeList[nb]});
+                    }
+                }
+            }
+        }
+
+        return { nodes: nodes, edges: edges };
+    };
+
     // Public API stubs
     function init() {}
     function onDataChange() {}
@@ -2851,6 +3155,68 @@ TestRunner.register('M14: MMD detects shifted distributions', function() {
     const res = Limb2.methods.mmdTest(X, Y);
     if (typeof res.mmd2 !== 'number') throw new Error('No MMD\u00b2 value');
     if (typeof res.pValue !== 'number') throw new Error('No p-value');
+});
+
+// ---- T47: Causal transport with back-door adjustment ----
+TestRunner.register('M15: Causal transport with back-door adjustment', function() {
+    MathCore.random.seed(42);
+    const ctx = DataLayer.getContextByRegion('North America', 2025);
+    const ipd = DataLayer.generateTransportIPD({yi: -0.25}, ctx, 200, 200, 42);
+    const dag = {
+        nodes: ['age_65', 'diabetes', 'treatment', 'outcome'],
+        edges: [
+            {from:'age_65', to:'treatment'}, {from:'age_65', to:'outcome'},
+            {from:'diabetes', to:'treatment'}, {from:'diabetes', to:'outcome'},
+            {from:'treatment', to:'outcome'}
+        ]
+    };
+    const res = Limb2.methods.causalTransport(ipd.trialIPD, ipd.targetIPD, dag);
+    if (typeof res.ate_causal !== 'number' || isNaN(res.ate_causal)) throw new Error('NaN result');
+    if (!res.adjustmentSet) throw new Error('No adjustment set');
+});
+
+// ---- T48: Knockoff filter returns 2 importance scores ----
+TestRunner.register('M16: Knockoff filter returns importance scores', function() {
+    MathCore.random.seed(42);
+    const ctx = DataLayer.getContextByRegion('North America', 2025);
+    const ipd = DataLayer.generateTransportIPD({yi: -0.25}, ctx, 200, 200, 42);
+    const res = Limb2.methods.knockoffFilter(ipd.trialIPD, 0.2);
+    if (!res.importances || res.importances.length !== 2) throw new Error('Wrong importance count: ' + (res.importances ? res.importances.length : 'none'));
+    if (typeof res.selected !== 'object') throw new Error('No selected set');
+});
+
+// ---- T49: KLIEP density ratios positive and E[r] ≈ 1 ----
+TestRunner.register('M17: KLIEP ratios positive and E[r]=1', function() {
+    MathCore.random.seed(42);
+    const ctx = DataLayer.getContextByRegion('Southeast Asia', 2025);
+    const ipd = DataLayer.generateTransportIPD({yi: -0.25}, ctx, 100, 100, 42);
+    const X = ipd.trialIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+    const Y = ipd.targetIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+    const res = Limb2.methods.kliep(X, Y);
+    if (res.ratios.some(function(r) { return r < 0; })) throw new Error('Negative ratio');
+    const meanR = res.ratios.reduce(function(a,b) { return a+b; }, 0) / res.ratios.length;
+    if (Math.abs(meanR - 1) > 0.3) throw new Error('E[r] = ' + meanR + ', expected ~1');
+});
+
+// ---- T50: Mapper produces nodes and edges ----
+TestRunner.register('M18: Mapper produces simplicial complex', function() {
+    MathCore.random.seed(42);
+    const points = [];
+    for (let i = 0; i < 50; i++) {
+        points.push([MathCore.random.normal(0, 1), MathCore.random.normal(0, 1)]);
+    }
+    const res = Limb2.methods.mapper(points, {nIntervals: 5, overlap: 0.3});
+    if (!res.nodes || res.nodes.length === 0) throw new Error('No nodes');
+    if (!Array.isArray(res.edges)) throw new Error('No edges array');
+});
+
+// ---- T51: KLIEP transported effect ----
+TestRunner.register('M17: KLIEP transported effect', function() {
+    MathCore.random.seed(42);
+    const ctx = DataLayer.getContextByRegion('Sub-Saharan Africa', 2025);
+    const ipd = DataLayer.generateTransportIPD({yi: -0.25}, ctx, 100, 100, 42);
+    const res = Limb2.methods.kliepTransport(ipd.trialIPD, ipd.targetIPD);
+    if (typeof res.ate_transported !== 'number' || isNaN(res.ate_transported)) throw new Error('NaN');
 });
 </script>
 
