@@ -966,6 +966,9 @@ const App = (() => {
                 document.getElementById('panel-' + tabId).classList.add('active');
             });
         });
+
+        // Initialize Limb1 visualization
+        Limb1.init();
     }
 
     function updateStatus(msg) {
@@ -1382,12 +1385,469 @@ const Limb1 = (() => {
         };
     };
 
-    // Public API stubs (filled in later tasks)
-    function init() {}
-    function onDataChange(data) {}
-    function exportCSV() {}
-    function exportPNG() {}
-    function getResults() { return null; }
+    // --- Visualization ---
+    const COLORS = {
+        study: '#4e8cff', pooled: '#34d399', pi: '#fbbf24',
+        conformal: '#fb923c', grid: '#2a3555', text: '#e0e6f0',
+        muted: '#8892a8', bg: '#131a2b', red: '#f87171', green: '#34d399',
+        cluster0: '#4e8cff', cluster1: '#34d399', cluster2: '#fbbf24', cluster3: '#fb923c'
+    };
+
+    const METHOD_LIST = [
+        {id: 'reml_kh',      label: 'REML + KH',               group: 'pooling'},
+        {id: 'bayesian_nma', label: 'Bayesian NMA',             group: 'pooling'},
+        {id: 'forest',       label: 'Forest Plot',              group: 'viz'},
+        {id: 'spectral',     label: 'Spectral Decomposition',   group: 'geometry'},
+        {id: 'geodesic',     label: 'Geodesic Embedding',       group: 'geometry'},
+        {id: 'persistence',  label: 'Persistence Diagram',      group: 'tda'},
+        {id: 'conformal',    label: 'Conformal PI',             group: 'prediction'},
+        {id: 'inconsistency',label: 'Node-Splitting',           group: 'consistency'}
+    ];
+
+    let activeMethod = 'forest';
+    let currentResults = null;
+
+    function init() {
+        const bar = document.getElementById('limb1-methods');
+        bar.innerHTML = '';
+        for (const m of METHOD_LIST) {
+            const btn = document.createElement('button');
+            btn.className = 'method-btn' + (m.id === activeMethod ? ' active' : '');
+            btn.textContent = m.label;
+            btn.setAttribute('role', 'radio');
+            btn.setAttribute('aria-checked', m.id === activeMethod ? 'true' : 'false');
+            btn.addEventListener('click', function() { selectMethod(m.id); });
+            bar.appendChild(btn);
+        }
+        onDataChange(DataLayer.getActive());
+    }
+
+    function selectMethod(methodId) {
+        activeMethod = methodId;
+        const found = METHOD_LIST.find(function(m) { return m.id === methodId; });
+        document.querySelectorAll('#limb1-methods .method-btn').forEach(function(b) {
+            const isActive = found && b.textContent === found.label;
+            b.classList.toggle('active', isActive);
+            b.setAttribute('aria-checked', isActive ? 'true' : 'false');
+        });
+        render();
+    }
+
+    function onDataChange(data) {
+        if (!data) return;
+        runAnalysis(data);
+        render();
+    }
+
+    function runAnalysis(data) {
+        const yi = data.trialsYiVi.map(function(t) { return t.yi; });
+        const vi = data.trialsYiVi.map(function(t) { return t.vi; });
+        const trials = data.trialsYiVi;
+
+        const reml = methods.reml(yi, vi);
+        const kh = methods.knappHartung(yi, vi, reml.tau2, reml.mu);
+        const pi = methods.predictionInterval(yi, vi, reml.tau2, reml.mu, reml.se);
+        const conformal = methods.conformalPI(yi, vi, reml.tau2, reml.mu);
+        const geodesicDist = methods.geodesicDistanceMatrix(yi, vi);
+        const mdsCoords = methods.mds(geodesicDist, 2);
+        const clusters = methods.hierarchicalCluster(geodesicDist, Math.min(3, yi.length));
+        const spectral = methods.spectralDecomposition(yi, vi);
+        const persistence = MathCore.tda.vietorisRips(geodesicDist);
+
+        let nma = null, nodeSplit = null;
+        if (data.format === 'nma') {
+            nma = methods.mcmcNMA(trials, {warmup: 1000, samples: 2000, chains: 2, seed: 42});
+            nodeSplit = methods.nodeSplit(trials);
+        }
+
+        currentResults = {
+            reml, kh, pi, conformal, geodesicDist, mdsCoords,
+            clusters, spectral, persistence, nma, nodeSplit,
+            yi, vi, trials, data
+        };
+    }
+
+    function render() {
+        if (!currentResults) return;
+        const canvas = document.getElementById('limb1-canvas');
+        const ctx = canvas.getContext('2d');
+        const W = canvas.width, H = canvas.height;
+        ctx.clearRect(0, 0, W, H);
+
+        const title = document.getElementById('limb1-viz-title');
+
+        switch (activeMethod) {
+            case 'forest':
+            case 'reml_kh':
+                title.textContent = 'Forest Plot — REML + Knapp-Hartung';
+                drawForestPlot(ctx, W, H);
+                break;
+            case 'bayesian_nma':
+                title.textContent = currentResults.nma ? 'Bayesian NMA Posterior' : 'Bayesian NMA (requires NMA data)';
+                if (currentResults.nma) drawNMAPosterior(ctx, W, H);
+                break;
+            case 'spectral':
+                title.textContent = 'Spectral Heterogeneity Decomposition';
+                drawScreePlot(ctx, W, H);
+                break;
+            case 'geodesic':
+                title.textContent = 'Riemannian Geodesic Embedding (MDS)';
+                drawMDS(ctx, W, H);
+                break;
+            case 'persistence':
+                title.textContent = 'Persistent Homology — Persistence Diagram';
+                drawPersistence(ctx, W, H);
+                break;
+            case 'conformal':
+                title.textContent = 'Conformal vs Parametric Prediction Intervals';
+                drawForestPlot(ctx, W, H, true);
+                break;
+            case 'inconsistency':
+                title.textContent = 'Node-Splitting Inconsistency Test';
+                drawNodeSplit(ctx, W, H);
+                break;
+        }
+        updateResultsTable();
+    }
+
+    function drawForestPlot(ctx, W, H, showConformal) {
+        showConformal = showConformal || false;
+        const yi = currentResults.yi, vi = currentResults.vi;
+        const reml = currentResults.reml, kh = currentResults.kh;
+        const pi = currentResults.pi, conformal = currentResults.conformal;
+        const data = currentResults.data;
+        const k = yi.length;
+        const margin = {top: 40, right: 220, bottom: 40, left: 180};
+        const plotW = W - margin.left - margin.right;
+        const plotH = H - margin.top - margin.bottom;
+
+        // Determine x-axis range
+        const allVals = yi.concat([reml.mu, kh.ci_lower, kh.ci_upper]);
+        if (isFinite(pi.lower)) allVals.push(pi.lower);
+        if (isFinite(pi.upper)) allVals.push(pi.upper);
+        let xMin = Math.min.apply(null, allVals) - 0.2;
+        let xMax = Math.max.apply(null, allVals) + 0.2;
+
+        function xScale(v) { return margin.left + (v - xMin) / (xMax - xMin) * plotW; }
+        function yScale(i) { return margin.top + (i + 0.5) / (k + 2) * plotH; }
+
+        // Null line at x=0
+        ctx.strokeStyle = COLORS.grid; ctx.lineWidth = 0.5;
+        ctx.beginPath(); ctx.moveTo(xScale(0), margin.top); ctx.lineTo(xScale(0), H - margin.bottom); ctx.stroke();
+
+        ctx.font = '11px -apple-system, sans-serif';
+        const maxW = Math.max.apply(null, vi.map(function(v) { return 1/v; }));
+
+        for (let i = 0; i < k; i++) {
+            const y = yScale(i);
+            const se = Math.sqrt(vi[i]);
+            const lo = yi[i] - 1.96 * se, hi = yi[i] + 1.96 * se;
+
+            // CI line
+            ctx.strokeStyle = COLORS.study; ctx.lineWidth = 1.5;
+            ctx.beginPath(); ctx.moveTo(xScale(lo), y); ctx.lineTo(xScale(hi), y); ctx.stroke();
+
+            // Point estimate square (size ∝ weight)
+            const weight = 1 / vi[i];
+            const size = 3 + 8 * (weight / maxW);
+            ctx.fillStyle = COLORS.study;
+            ctx.fillRect(xScale(yi[i]) - size/2, y - size/2, size, size);
+
+            // Study label
+            ctx.fillStyle = COLORS.text; ctx.textAlign = 'right';
+            const label = (data.trials && data.trials[i] && data.trials[i].trial_name) ? data.trials[i].trial_name : ('Study ' + (i+1));
+            ctx.fillText(label, margin.left - 8, y + 4);
+
+            // RR text on right
+            ctx.textAlign = 'left';
+            ctx.fillText(Math.exp(yi[i]).toFixed(2) + ' [' + Math.exp(lo).toFixed(2) + ', ' + Math.exp(hi).toFixed(2) + ']', xScale(xMax) + 4, y + 4);
+        }
+
+        // Pooled estimate diamond
+        const poolY = yScale(k + 0.5);
+        ctx.fillStyle = COLORS.pooled;
+        ctx.beginPath();
+        ctx.moveTo(xScale(reml.mu), poolY - 8);
+        ctx.lineTo(xScale(kh.ci_upper), poolY);
+        ctx.lineTo(xScale(reml.mu), poolY + 8);
+        ctx.lineTo(xScale(kh.ci_lower), poolY);
+        ctx.closePath(); ctx.fill();
+
+        ctx.fillStyle = COLORS.text; ctx.textAlign = 'right';
+        ctx.fillText('Pooled (REML+KH)', margin.left - 8, poolY + 4);
+
+        // Prediction interval (dashed yellow)
+        if (isFinite(pi.lower) && isFinite(pi.upper)) {
+            ctx.strokeStyle = COLORS.pi; ctx.lineWidth = 2; ctx.setLineDash([5, 3]);
+            ctx.beginPath(); ctx.moveTo(xScale(pi.lower), poolY); ctx.lineTo(xScale(pi.upper), poolY); ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        // Conformal PI (dashed orange, offset below)
+        if (showConformal && isFinite(conformal.lower) && isFinite(conformal.upper)) {
+            const cY = poolY + 20;
+            ctx.strokeStyle = COLORS.conformal; ctx.lineWidth = 2; ctx.setLineDash([3, 3]);
+            ctx.beginPath(); ctx.moveTo(xScale(conformal.lower), cY); ctx.lineTo(xScale(conformal.upper), cY); ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = COLORS.conformal; ctx.textAlign = 'right';
+            ctx.fillText('Conformal PI', margin.left - 8, cY + 4);
+        }
+
+        // X-axis label
+        ctx.fillStyle = COLORS.muted; ctx.textAlign = 'center'; ctx.font = '12px -apple-system, sans-serif';
+        ctx.fillText('log(RR)', W / 2, H - 10);
+    }
+
+    function drawNMAPosterior(ctx, W, H) {
+        if (!currentResults.nma) return;
+        const nma = currentResults.nma;
+        const margin = {top: 40, right: 40, bottom: 50, left: 60};
+        const plotW = W - margin.left - margin.right;
+        const plotH = H - margin.top - margin.bottom;
+
+        const chain = nma.chains[0];
+        const values = chain.map(function(s) { return s.mu1; });
+        const n = values.length;
+        const yMin = Math.min.apply(null, values) - 0.05;
+        const yMax = Math.max.apply(null, values) + 0.05;
+
+        ctx.strokeStyle = COLORS.study; ctx.lineWidth = 0.5;
+        ctx.beginPath();
+        for (let i = 0; i < n; i++) {
+            const x = margin.left + (i / n) * plotW;
+            const y = margin.top + (1 - (values[i] - yMin) / (yMax - yMin)) * plotH;
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        if (nma.chains.length > 1) {
+            const chain2 = nma.chains[1].map(function(s) { return s.mu1; });
+            ctx.strokeStyle = COLORS.green; ctx.lineWidth = 0.5;
+            ctx.beginPath();
+            for (let i = 0; i < chain2.length; i++) {
+                const x = margin.left + (i / chain2.length) * plotW;
+                const y = margin.top + (1 - (chain2[i] - yMin) / (yMax - yMin)) * plotH;
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+        }
+
+        // Mean line
+        ctx.strokeStyle = COLORS.red; ctx.lineWidth = 2; ctx.setLineDash([4,2]);
+        const meanY = margin.top + (1 - (nma.mu1_mean - yMin) / (yMax - yMin)) * plotH;
+        ctx.beginPath(); ctx.moveTo(margin.left, meanY); ctx.lineTo(W - margin.right, meanY); ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = COLORS.text; ctx.font = '12px -apple-system, sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('MCMC Iteration', W/2, H - 10);
+        ctx.save(); ctx.translate(15, H/2); ctx.rotate(-Math.PI/2);
+        ctx.fillText('mu1 (Drug 1 vs Placebo)', 0, 0);
+        ctx.restore();
+
+        ctx.fillStyle = COLORS.muted; ctx.textAlign = 'left'; ctx.font = '11px -apple-system, sans-serif';
+        ctx.fillText('Mean: ' + nma.mu1_mean.toFixed(4) + '  Rhat: ' + nma.rhat_mu1.toFixed(3), margin.left + 10, margin.top + 20);
+    }
+
+    function drawScreePlot(ctx, W, H) {
+        const spectral = currentResults.spectral;
+        const vals = spectral.eigenvalues.filter(function(v) { return v > 0; });
+        const k = vals.length;
+        if (k === 0) return;
+
+        const margin = {top: 40, right: 40, bottom: 50, left: 60};
+        const plotW = W - margin.left - margin.right;
+        const plotH = H - margin.top - margin.bottom;
+        const barW = Math.min(40, plotW / k - 4);
+        const maxVal = Math.max.apply(null, vals);
+
+        for (let i = 0; i < k; i++) {
+            const x = margin.left + (i + 0.5) * (plotW / k) - barW / 2;
+            const barH = (vals[i] / maxVal) * plotH;
+            const y = margin.top + plotH - barH;
+            ctx.fillStyle = 'hsl(' + (220 + i * 30) + ', 70%, 60%)';
+            ctx.fillRect(x, y, barW, barH);
+            ctx.fillStyle = COLORS.muted; ctx.font = '10px sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText((spectral.proportions[i] * 100).toFixed(0) + '%', x + barW/2, y - 6);
+        }
+
+        ctx.fillStyle = COLORS.text; ctx.textAlign = 'center'; ctx.font = '12px sans-serif';
+        ctx.fillText('Eigenvalue Index', W/2, H - 10);
+    }
+
+    function drawMDS(ctx, W, H) {
+        const mdsCoords = currentResults.mdsCoords;
+        const clusters = currentResults.clusters;
+        const data = currentResults.data;
+        const viArr = currentResults.vi;
+        const margin = {top: 40, right: 40, bottom: 50, left: 60};
+        const plotW = W - margin.left - margin.right;
+        const plotH = H - margin.top - margin.bottom;
+
+        const xs = mdsCoords.map(function(c) { return c[0]; });
+        const ys = mdsCoords.map(function(c) { return c[1]; });
+        const xMin = Math.min.apply(null, xs), xMax = Math.max.apply(null, xs);
+        const yMin = Math.min.apply(null, ys), yMax = Math.max.apply(null, ys);
+        const xRange = (xMax - xMin) || 1, yRange = (yMax - yMin) || 1;
+        const clusterColors = [COLORS.cluster0, COLORS.cluster1, COLORS.cluster2, COLORS.cluster3];
+        const minVi = Math.min.apply(null, viArr);
+
+        for (let i = 0; i < mdsCoords.length; i++) {
+            const px = margin.left + ((xs[i] - xMin) / xRange) * plotW;
+            const py = margin.top + ((ys[i] - yMin) / yRange) * plotH;
+            const r = Math.min(4 + 6 * (1 / (Math.sqrt(viArr[i]) + 0.001)) / (1 / (Math.sqrt(minVi) + 0.001)), 12);
+            ctx.fillStyle = clusterColors[clusters[i] % 4];
+            ctx.beginPath(); ctx.arc(px, py, r, 0, 2 * Math.PI); ctx.fill();
+
+            if (mdsCoords.length <= 20) {
+                ctx.fillStyle = COLORS.text; ctx.font = '10px sans-serif'; ctx.textAlign = 'left';
+                const label = (data.trials && data.trials[i] && data.trials[i].trial_name) ? data.trials[i].trial_name : ('' + (i+1));
+                ctx.fillText(label, px + 8, py + 3);
+            }
+        }
+
+        ctx.fillStyle = COLORS.text; ctx.textAlign = 'center'; ctx.font = '12px sans-serif';
+        ctx.fillText('MDS Dimension 1', W/2, H - 10);
+    }
+
+    function drawPersistence(ctx, W, H) {
+        const persistence = currentResults.persistence;
+        const margin = {top: 40, right: 40, bottom: 50, left: 60};
+        const plotW = W - margin.left - margin.right;
+        const plotH = H - margin.top - margin.bottom;
+
+        const allDeaths = persistence.h0.map(function(f) { return f.death; }).filter(isFinite);
+        const maxD = allDeaths.length > 0 ? Math.max.apply(null, allDeaths) * 1.2 : 1;
+
+        // Diagonal line (birth = death)
+        ctx.strokeStyle = COLORS.grid; ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(margin.left, margin.top + plotH);
+        ctx.lineTo(margin.left + plotW, margin.top);
+        ctx.stroke();
+
+        // H0 circles
+        for (const f of persistence.h0) {
+            if (!isFinite(f.death)) continue;
+            const x = margin.left + (f.birth / maxD) * plotW;
+            const y = margin.top + (1 - f.death / maxD) * plotH;
+            ctx.fillStyle = COLORS.study;
+            ctx.beginPath(); ctx.arc(x, y, 5, 0, 2 * Math.PI); ctx.fill();
+        }
+
+        // H1 triangles
+        for (const f of persistence.h1) {
+            const death = isFinite(f.death) ? f.death : maxD;
+            const x = margin.left + (f.birth / maxD) * plotW;
+            const y = margin.top + (1 - death / maxD) * plotH;
+            ctx.fillStyle = COLORS.red;
+            ctx.beginPath();
+            ctx.moveTo(x, y - 5); ctx.lineTo(x + 5, y + 5); ctx.lineTo(x - 5, y + 5);
+            ctx.closePath(); ctx.fill();
+        }
+
+        // Legend
+        ctx.fillStyle = COLORS.study;
+        ctx.beginPath(); ctx.arc(W - 120, 20, 5, 0, 2*Math.PI); ctx.fill();
+        ctx.fillStyle = COLORS.text; ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+        ctx.fillText('H0 (components)', W - 110, 24);
+        ctx.fillStyle = COLORS.red;
+        ctx.beginPath(); ctx.moveTo(W - 120, 40); ctx.lineTo(W - 115, 50); ctx.lineTo(W - 125, 50); ctx.closePath(); ctx.fill();
+        ctx.fillStyle = COLORS.text;
+        ctx.fillText('H1 (loops)', W - 110, 48);
+
+        ctx.fillStyle = COLORS.text; ctx.textAlign = 'center'; ctx.font = '12px sans-serif';
+        ctx.fillText('Birth', W/2, H - 10);
+    }
+
+    function drawNodeSplit(ctx, W, H) {
+        if (!currentResults.nodeSplit) {
+            ctx.fillStyle = COLORS.muted; ctx.font = '14px sans-serif'; ctx.textAlign = 'center';
+            ctx.fillText('Node-splitting requires NMA data (t1/t2 columns)', W/2, H/2);
+            return;
+        }
+        const results = currentResults.nodeSplit;
+        const margin = {top: 40, right: 40, bottom: 40, left: 120};
+        const plotH = H - margin.top - margin.bottom;
+        const plotW = W - margin.left - margin.right;
+        const n = results.length;
+        if (n === 0) return;
+
+        const allVals = [0];
+        for (const r of results) {
+            if (!r.direct_only) { allVals.push(r.ci_lower, r.ci_upper, r.difference); }
+        }
+        const xMin = Math.min.apply(null, allVals) - 0.1;
+        const xMax = Math.max.apply(null, allVals) + 0.1;
+        function xScale(v) { return margin.left + (v - xMin) / (xMax - xMin) * plotW; }
+
+        ctx.strokeStyle = COLORS.grid; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(xScale(0), margin.top); ctx.lineTo(xScale(0), H - margin.bottom); ctx.stroke();
+
+        for (let i = 0; i < n; i++) {
+            const r = results[i];
+            const y = margin.top + (i + 0.5) / n * plotH;
+            ctx.fillStyle = COLORS.text; ctx.textAlign = 'right'; ctx.font = '11px sans-serif';
+            ctx.fillText(r.comparison, margin.left - 8, y + 4);
+
+            if (r.direct_only) {
+                ctx.fillStyle = COLORS.muted; ctx.textAlign = 'left';
+                ctx.fillText('Direct only', xScale(0) + 10, y + 4);
+                continue;
+            }
+
+            ctx.strokeStyle = r.inconsistent ? COLORS.red : COLORS.green;
+            ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.moveTo(xScale(r.ci_lower), y); ctx.lineTo(xScale(r.ci_upper), y); ctx.stroke();
+
+            ctx.fillStyle = r.inconsistent ? COLORS.red : COLORS.green;
+            ctx.beginPath(); ctx.arc(xScale(r.difference), y, 5, 0, 2 * Math.PI); ctx.fill();
+        }
+    }
+
+    function updateResultsTable() {
+        const el = document.getElementById('limb1-results');
+        if (!currentResults) { el.innerHTML = ''; return; }
+        const reml = currentResults.reml, kh = currentResults.kh;
+        const pi = currentResults.pi, conformal = currentResults.conformal;
+
+        el.innerHTML = '<table class="results-table">' +
+            '<tr><th>Metric</th><th>Value</th></tr>' +
+            '<tr><td>Pooled log-RR (REML)</td><td>' + reml.mu.toFixed(4) + '</td></tr>' +
+            '<tr><td>Pooled RR</td><td>' + Math.exp(reml.mu).toFixed(4) + '</td></tr>' +
+            '<tr><td>\u03c4\u00b2 (REML)</td><td>' + reml.tau2.toFixed(6) + '</td></tr>' +
+            '<tr><td>I\u00b2</td><td>' + reml.I2.toFixed(1) + '%</td></tr>' +
+            '<tr><td>KH 95% CI (RR)</td><td>[' + Math.exp(kh.ci_lower).toFixed(3) + ', ' + Math.exp(kh.ci_upper).toFixed(3) + ']</td></tr>' +
+            '<tr><td>95% Prediction Interval (RR)</td><td>[' + (isFinite(pi.lower) ? Math.exp(pi.lower).toFixed(3) : '-Inf') + ', ' + (isFinite(pi.upper) ? Math.exp(pi.upper).toFixed(3) : '+Inf') + ']</td></tr>' +
+            '<tr><td>Conformal PI (RR)</td><td>[' + (isFinite(conformal.lower) ? Math.exp(conformal.lower).toFixed(3) : '-Inf') + ', ' + (isFinite(conformal.upper) ? Math.exp(conformal.upper).toFixed(3) : '+Inf') + ']</td></tr>' +
+            '<tr><td>Studies (k)</td><td>' + reml.k + '</td></tr>' +
+            '</table>';
+    }
+
+    function getResults() { return currentResults; }
+
+    function exportCSV() {
+        if (!currentResults) return;
+        const yi = currentResults.yi, vi = currentResults.vi, reml = currentResults.reml;
+        let csv = 'study,yi,vi,weight,rr,ci_lower,ci_upper\n';
+        for (let i = 0; i < yi.length; i++) {
+            const se = Math.sqrt(vi[i]);
+            csv += (i+1) + ',' + yi[i].toFixed(6) + ',' + vi[i].toFixed(6) + ',' +
+                   reml.weights[i].toFixed(4) + ',' + Math.exp(yi[i]).toFixed(4) + ',' +
+                   Math.exp(yi[i] - 1.96*se).toFixed(4) + ',' + Math.exp(yi[i] + 1.96*se).toFixed(4) + '\n';
+        }
+        const blob = new Blob([csv], {type: 'text/csv'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'limb1_results.csv';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+
+    function exportPNG() {
+        const canvas = document.getElementById('limb1-canvas');
+        const url = canvas.toDataURL('image/png');
+        const a = document.createElement('a'); a.href = url; a.download = 'limb1_plot.png';
+        document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    }
 
     return { methods, init, onDataChange, exportCSV, exportPNG, getResults };
 })();
@@ -1707,6 +2167,48 @@ TestRunner.register('M10: Conformal PI exists and has width', function() {
     let muSum = 0; for (let i = 0; i < yi.length; i++) muSum += yi[i]; const mu = muSum / yi.length;
     const res = Limb1.methods.conformalPI(yi, vi, tau2, mu, 0.95);
     if (res.upper <= res.lower) throw new Error('PI has zero or negative width: [' + res.lower + ', ' + res.upper + ']');
+});
+
+// ---- T33: Full pipeline on colchicine (end-to-end) ----
+TestRunner.register('Integration: full Limb1 on colchicine', function() {
+    const d = DataLayer.load('colchicine');
+    const yi = d.trialsYiVi.map(function(t) { return t.yi; });
+    const vi = d.trialsYiVi.map(function(t) { return t.vi; });
+    const reml = Limb1.methods.reml(yi, vi);
+    const kh = Limb1.methods.knappHartung(yi, vi, reml.tau2, reml.mu);
+    const pi = Limb1.methods.predictionInterval(yi, vi, reml.tau2, reml.mu, reml.se);
+    const conf = Limb1.methods.conformalPI(yi, vi, reml.tau2, reml.mu);
+    const D = Limb1.methods.geodesicDistanceMatrix(yi, vi);
+    const mds = Limb1.methods.mds(D, 2);
+    const spectral = Limb1.methods.spectralDecomposition(yi, vi);
+    const ph = MathCore.tda.vietorisRips(D);
+
+    if (reml.tau2 < 0) throw new Error('Negative tau\u00b2: ' + reml.tau2);
+    if (kh.ci_lower >= kh.ci_upper) throw new Error('KH CI inverted: [' + kh.ci_lower + ', ' + kh.ci_upper + ']');
+    if (pi.lower >= pi.upper) throw new Error('PI inverted: [' + pi.lower + ', ' + pi.upper + ']');
+    if (conf.lower >= conf.upper) throw new Error('Conformal PI inverted: [' + conf.lower + ', ' + conf.upper + ']');
+    if (mds.length !== 4) throw new Error('MDS wrong count: expected 4, got ' + mds.length);
+    if (spectral.eigenvalues.length !== 4) throw new Error('Spectral wrong count: expected 4, got ' + spectral.eigenvalues.length);
+    if (ph.h0.length !== 3) throw new Error('H0 should have 3 features, got ' + ph.h0.length);
+});
+
+// ---- T34: Full pipeline on synthetic NMA ----
+TestRunner.register('Integration: full Limb1 on synthetic NMA', function() {
+    const d = DataLayer.load('nma_synthetic');
+    const yi = d.trialsYiVi.map(function(t) { return t.yi; });
+    const vi = d.trialsYiVi.map(function(t) { return t.vi; });
+    const reml = Limb1.methods.reml(yi, vi);
+    if (reml.k !== 1000) throw new Error('Expected 1000 studies, got ' + reml.k);
+    if (Math.exp(reml.mu) > 1 || Math.exp(reml.mu) < 0.5) throw new Error('Pooled RR ' + Math.exp(reml.mu) + ' out of range [0.5, 1.0]');
+});
+
+// ---- T35: MCMC on 60-trial subsample ----
+TestRunner.register('Integration: MCMC NMA on 60-trial subsample', function() {
+    MathCore.random.seed(42);
+    const d = DataLayer.load('nma_synthetic');
+    const subset = d.trialsYiVi.slice(0, 60);
+    const nma = Limb1.methods.mcmcNMA(subset, {warmup: 500, samples: 1000, chains: 1, seed: 42});
+    if (Math.abs(nma.mu1_mean) > 1) throw new Error('mu1=' + nma.mu1_mean + ' implausible (|mu1| > 1)');
 });
 </script>
 
