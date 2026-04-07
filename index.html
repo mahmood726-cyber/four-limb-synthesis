@@ -1,0 +1,1082 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta property="og:title" content="Four-Limb Evidence Synthesis">
+<meta property="og:description" content="Advanced meta-analysis with information geometry, TDA, and causal transport">
+<title>Four-Limb Evidence Synthesis</title>
+<style>
+:root {
+    --bg: #0a0e17;
+    --surface: #131a2b;
+    --surface2: #1a2340;
+    --border: #2a3555;
+    --text: #e0e6f0;
+    --text-muted: #8892a8;
+    --accent: #4e8cff;
+    --accent-glow: rgba(78,140,255,0.15);
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --orange: #fb923c;
+    --font-mono: 'Consolas', 'Monaco', 'Courier New', monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --viridis-0: #440154; --viridis-1: #482777; --viridis-2: #3f4a8a;
+    --viridis-3: #31688e; --viridis-4: #26838f; --viridis-5: #1f9d8a;
+    --viridis-6: #6cce5a; --viridis-7: #b6de2b; --viridis-8: #fee825;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: var(--font-sans); background: var(--bg); color: var(--text);
+    line-height: 1.6; min-height: 100vh;
+}
+.app-header {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 16px 24px; display: flex; align-items: center; gap: 24px;
+    flex-wrap: wrap;
+}
+.app-header h1 { font-size: 1.4rem; font-weight: 700; letter-spacing: -0.02em; }
+.app-header h1 span { color: var(--accent); }
+.header-controls { display: flex; gap: 12px; align-items: center; margin-left: auto; }
+select, button, input[type="file"] {
+    font-family: var(--font-sans); font-size: 0.85rem; padding: 6px 12px;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--surface2); color: var(--text); cursor: pointer;
+}
+select:hover, button:hover { border-color: var(--accent); }
+button.primary {
+    background: var(--accent); color: #fff; border-color: var(--accent);
+    font-weight: 600;
+}
+button.primary:hover { opacity: 0.9; }
+.tab-bar {
+    display: flex; background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 0 24px; gap: 0;
+}
+.tab-btn {
+    padding: 12px 20px; border: none; background: none; color: var(--text-muted);
+    font-size: 0.9rem; font-weight: 500; cursor: pointer; position: relative;
+    border-bottom: 2px solid transparent; transition: all 0.2s;
+}
+.tab-btn:hover:not(.disabled) { color: var(--text); }
+.tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tab-btn.disabled { opacity: 0.35; cursor: not-allowed; }
+.tab-panel { display: none; padding: 24px; }
+.tab-panel.active { display: block; }
+.method-bar {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px;
+    padding: 12px; background: var(--surface); border-radius: 8px;
+    border: 1px solid var(--border);
+}
+.method-btn {
+    padding: 6px 14px; border: 1px solid var(--border); border-radius: 20px;
+    background: var(--surface2); color: var(--text-muted); font-size: 0.8rem;
+    cursor: pointer; transition: all 0.2s;
+}
+.method-btn:hover { border-color: var(--accent); color: var(--text); }
+.method-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.viz-container {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; margin-bottom: 16px; min-height: 400px; position: relative;
+}
+.viz-title {
+    font-size: 0.85rem; font-weight: 600; color: var(--text-muted);
+    margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+}
+.results-table {
+    width: 100%; border-collapse: collapse; font-size: 0.85rem;
+    background: var(--surface); border-radius: 8px; overflow: hidden;
+}
+.results-table th {
+    background: var(--surface2); padding: 10px 12px; text-align: left;
+    font-weight: 600; color: var(--text-muted); border-bottom: 1px solid var(--border);
+}
+.results-table td {
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+}
+.results-table tr:hover td { background: var(--accent-glow); }
+.export-bar {
+    display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end;
+}
+.status-bar {
+    position: fixed; bottom: 0; left: 0; right: 0; padding: 8px 24px;
+    background: var(--surface); border-top: 1px solid var(--border);
+    font-size: 0.8rem; color: var(--text-muted); display: flex;
+    justify-content: space-between; z-index: 100;
+}
+.footer-links a { color: var(--accent); text-decoration: none; margin-left: 16px; }
+.footer-links a:hover { text-decoration: underline; }
+.split-pane { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .split-pane { grid-template-columns: 1fr; } }
+.card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+}
+.card h3 { font-size: 0.95rem; margin-bottom: 8px; }
+.badge {
+    display: inline-block; padding: 2px 8px; border-radius: 12px;
+    font-size: 0.75rem; font-weight: 600;
+}
+.badge-green { background: rgba(52,211,153,0.15); color: var(--green); }
+.badge-red { background: rgba(248,113,113,0.15); color: var(--red); }
+.badge-yellow { background: rgba(251,191,36,0.15); color: var(--yellow); }
+canvas { image-rendering: pixelated; }
+.spinner {
+    display: inline-block; width: 16px; height: 16px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.6s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.upload-zone {
+    border: 2px dashed var(--border); border-radius: 8px; padding: 24px;
+    text-align: center; color: var(--text-muted); cursor: pointer;
+    transition: border-color 0.2s;
+}
+.upload-zone:hover { border-color: var(--accent); }
+.test-panel {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px; margin-top: 16px; max-height: 400px; overflow-y: auto;
+    font-family: var(--font-mono); font-size: 0.8rem;
+}
+.test-pass { color: var(--green); }
+.test-fail { color: var(--red); }
+</style>
+</head>
+<body>
+
+<header class="app-header">
+    <h1>Four-Limb <span>Evidence Synthesis</span></h1>
+    <div class="header-controls">
+        <select id="dataset-select" aria-label="Select dataset">
+            <option value="colchicine">Colchicine / ACS (4 trials)</option>
+            <option value="sglt2">SGLT2i / HF (4 trials)</option>
+            <option value="nma_synthetic">Synthetic NMA (1000 trials)</option>
+            <option value="custom">Custom Upload...</option>
+        </select>
+        <input type="file" id="file-upload" accept=".csv" style="display:none" aria-label="Upload CSV">
+        <button id="btn-upload" onclick="document.getElementById('file-upload').click()">Upload CSV</button>
+        <button id="btn-run-tests" class="primary">Run Tests</button>
+    </div>
+</header>
+
+<nav class="tab-bar" role="tablist">
+    <button class="tab-btn active" role="tab" aria-selected="true" data-tab="limb1">Limb 1: Trial Efficacy</button>
+    <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="limb2" disabled>Limb 2: Causal Transport</button>
+    <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="limb3" disabled>Limb 3: Economics</button>
+    <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="limb4" disabled>Limb 4: Uncertainty</button>
+    <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="integration" disabled>Integration</button>
+</nav>
+
+<main>
+    <div id="panel-limb1" class="tab-panel active" role="tabpanel">
+        <div class="method-bar" id="limb1-methods" role="radiogroup" aria-label="Select method">
+            <!-- Method buttons injected by Limb1.init() -->
+        </div>
+        <div id="limb1-viz" class="viz-container">
+            <div class="viz-title" id="limb1-viz-title">Select a method to begin</div>
+            <canvas id="limb1-canvas" width="900" height="500"></canvas>
+        </div>
+        <div id="limb1-results"></div>
+        <div class="export-bar">
+            <button onclick="if(typeof Limb1!=='undefined')Limb1.exportCSV()">Export CSV</button>
+            <button onclick="if(typeof Limb1!=='undefined')Limb1.exportPNG()">Export PNG</button>
+        </div>
+    </div>
+    <div id="panel-limb2" class="tab-panel" role="tabpanel"></div>
+    <div id="panel-limb3" class="tab-panel" role="tabpanel"></div>
+    <div id="panel-limb4" class="tab-panel" role="tabpanel"></div>
+    <div id="panel-integration" class="tab-panel" role="tabpanel"></div>
+</main>
+
+<div id="test-output" class="test-panel" style="display:none"></div>
+
+<footer class="status-bar">
+    <span id="status-text">Ready</span>
+    <span class="footer-links">
+        Four-Limb Evidence Synthesis v1.0 — Phase 1
+        <a href="https://github.com/mahmood726-cyber/four-limb-synthesis" target="_blank">GitHub</a>
+    </span>
+</footer>
+
+<!-- ============================================================
+     SCRIPT 1: MathCore
+     ============================================================ -->
+<script>
+/* === MATHCORE === */
+const MathCore = (() => {
+    // --- Random: xoshiro128** ---
+    const random = (() => {
+        let s = new Uint32Array(4);
+
+        function seed(val) {
+            // SplitMix32 to initialize state from a single integer
+            let z = val >>> 0;
+            for (let i = 0; i < 4; i++) {
+                z = (z + 0x9e3779b9) >>> 0;
+                let t = z ^ (z >>> 16); t = Math.imul(t, 0x21f0aaad);
+                t = t ^ (t >>> 15); t = Math.imul(t, 0x735a2d97);
+                s[i] = (t ^ (t >>> 15)) >>> 0;
+            }
+        }
+
+        function rotl(x, k) { return ((x << k) | (x >>> (32 - k))) >>> 0; }
+
+        function nextU32() {
+            const result = (Math.imul(rotl(Math.imul(s[1], 5), 7), 9)) >>> 0;
+            const t = (s[1] << 9) >>> 0;
+            s[2] = (s[2] ^ s[0]) >>> 0;
+            s[3] = (s[3] ^ s[1]) >>> 0;
+            s[1] = (s[1] ^ s[2]) >>> 0;
+            s[0] = (s[0] ^ s[3]) >>> 0;
+            s[2] = (s[2] ^ t) >>> 0;
+            s[3] = rotl(s[3], 11);
+            return result;
+        }
+
+        function uniform() { return nextU32() / 4294967296; }
+
+        // Box-Muller for normal draws
+        let spareReady = false, spare = 0;
+        function normal(mu, sigma) {
+            mu = mu ?? 0; sigma = sigma ?? 1;
+            if (spareReady) { spareReady = false; return spare * sigma + mu; }
+            let u, v, s2;
+            do { u = uniform() * 2 - 1; v = uniform() * 2 - 1; s2 = u*u + v*v; }
+            while (s2 >= 1 || s2 === 0);
+            const f = Math.sqrt(-2 * Math.log(s2) / s2);
+            spare = v * f; spareReady = true;
+            return u * f * sigma + mu;
+        }
+
+        function gamma(alpha, beta) {
+            beta = beta ?? 1;
+            // Marsaglia & Tsang
+            if (alpha < 1) {
+                return gamma(alpha + 1, beta) * Math.pow(uniform(), 1 / alpha);
+            }
+            const d = alpha - 1/3, c = 1 / Math.sqrt(9 * d);
+            while (true) {
+                let x, v;
+                do { x = normal(); v = 1 + c * x; } while (v <= 0);
+                v = v * v * v;
+                const u = uniform();
+                if (u < 1 - 0.0331 * x * x * x * x) return d * v / beta;
+                if (Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v / beta;
+            }
+        }
+
+        function invGamma(alpha, beta) {
+            beta = beta ?? 1;
+            return beta / gamma(alpha, 1);
+        }
+
+        // LHS sampler: returns n x d matrix (flat Float64Array, row-major)
+        function lhs(n, d, seedVal) {
+            seed(seedVal);
+            const result = new Float64Array(n * d);
+            for (let j = 0; j < d; j++) {
+                const perm = Array.from({length: n}, (_, i) => i);
+                // Fisher-Yates shuffle
+                for (let i = n - 1; i > 0; i--) {
+                    const k = (nextU32() % (i + 1)) >>> 0;
+                    [perm[i], perm[k]] = [perm[k], perm[i]];
+                }
+                for (let i = 0; i < n; i++) {
+                    result[i * d + j] = (perm[i] + uniform()) / n;
+                }
+            }
+            return result;
+        }
+
+        return { seed, uniform, normal, gamma, invGamma, lhs, nextU32 };
+    })();
+
+    // --- Linear Algebra ---
+    const linalg = (() => {
+        // Create zero matrix (row-major flat array)
+        function zeros(r, c) { return { data: new Float64Array(r * c), rows: r, cols: c }; }
+        function eye(n) {
+            const m = zeros(n, n);
+            for (let i = 0; i < n; i++) m.data[i * n + i] = 1;
+            return m;
+        }
+        function get(m, i, j) { return m.data[i * m.cols + j]; }
+        function set(m, i, j, v) { m.data[i * m.cols + j] = v; }
+
+        function clone(m) { return { data: Float64Array.from(m.data), rows: m.rows, cols: m.cols }; }
+
+        function multiply(a, b) {
+            if (a.cols !== b.rows) throw new Error('Dimension mismatch');
+            const c = zeros(a.rows, b.cols);
+            for (let i = 0; i < a.rows; i++)
+                for (let k = 0; k < a.cols; k++) {
+                    const aik = get(a, i, k);
+                    for (let j = 0; j < b.cols; j++)
+                        c.data[i * c.cols + j] += aik * get(b, k, j);
+                }
+            return c;
+        }
+
+        function transpose(m) {
+            const t = zeros(m.cols, m.rows);
+            for (let i = 0; i < m.rows; i++)
+                for (let j = 0; j < m.cols; j++)
+                    set(t, j, i, get(m, i, j));
+            return t;
+        }
+
+        // Cholesky decomposition (lower triangular L such that A = L L^T)
+        function cholesky(m) {
+            const n = m.rows;
+            const L = zeros(n, n);
+            for (let i = 0; i < n; i++) {
+                for (let j = 0; j <= i; j++) {
+                    let sum = 0;
+                    for (let k = 0; k < j; k++) sum += get(L, i, k) * get(L, j, k);
+                    if (i === j) {
+                        const diag = get(m, i, i) - sum;
+                        if (diag <= 0) throw new Error('Matrix not positive definite');
+                        set(L, i, j, Math.sqrt(diag));
+                    } else {
+                        set(L, i, j, (get(m, i, j) - sum) / get(L, j, j));
+                    }
+                }
+            }
+            return L;
+        }
+
+        // Solve L x = b where L is lower triangular
+        function solveLower(L, b) {
+            const n = L.rows;
+            const x = new Float64Array(n);
+            for (let i = 0; i < n; i++) {
+                let sum = b[i];
+                for (let j = 0; j < i; j++) sum -= get(L, i, j) * x[j];
+                x[i] = sum / get(L, i, i);
+            }
+            return x;
+        }
+
+        // Solve L^T x = b where L is lower triangular
+        function solveUpper(L, b) {
+            const n = L.rows;
+            const x = new Float64Array(n);
+            for (let i = n - 1; i >= 0; i--) {
+                let sum = b[i];
+                for (let j = i + 1; j < n; j++) sum -= get(L, j, i) * x[j];
+                x[i] = sum / get(L, i, i);
+            }
+            return x;
+        }
+
+        // Solve A x = b via Cholesky
+        function solve(A, b) {
+            const L = cholesky(A);
+            const y = solveLower(L, b);
+            return solveUpper(L, y);
+        }
+
+        // Invert via Cholesky
+        function invert(A) {
+            const n = A.rows;
+            const L = cholesky(A);
+            const inv = zeros(n, n);
+            for (let col = 0; col < n; col++) {
+                const e = new Float64Array(n); e[col] = 1;
+                const y = solveLower(L, e);
+                const x = solveUpper(L, y);
+                for (let row = 0; row < n; row++) set(inv, row, col, x[row]);
+            }
+            return inv;
+        }
+
+        // Eigendecomposition via Jacobi algorithm (symmetric matrices only)
+        // Returns {values: Float64Array, vectors: matrix} sorted descending
+        function eigenSymmetric(A) {
+            const n = A.rows;
+            let T = clone(A);
+            let V = eye(n);
+
+            // Jacobi eigenvalue algorithm (more stable for small symmetric matrices)
+            for (let sweep = 0; sweep < 100; sweep++) {
+                let offDiag = 0;
+                for (let i = 0; i < n; i++)
+                    for (let j = i + 1; j < n; j++)
+                        offDiag += get(T, i, j) * get(T, i, j);
+                if (offDiag < 1e-20) break;
+
+                for (let p = 0; p < n - 1; p++) {
+                    for (let q = p + 1; q < n; q++) {
+                        const apq = get(T, p, q);
+                        if (Math.abs(apq) < 1e-15) continue;
+                        const tau = (get(T, q, q) - get(T, p, p)) / (2 * apq);
+                        const t = (tau >= 0 ? 1 : -1) / (Math.abs(tau) + Math.sqrt(1 + tau * tau));
+                        const c = 1 / Math.sqrt(1 + t * t);
+                        const s = t * c;
+
+                        // Rotate T
+                        const Rp = new Float64Array(n), Rq = new Float64Array(n);
+                        for (let i = 0; i < n; i++) { Rp[i] = get(T, i, p); Rq[i] = get(T, i, q); }
+                        for (let i = 0; i < n; i++) {
+                            set(T, i, p, c * Rp[i] - s * Rq[i]);
+                            set(T, i, q, s * Rp[i] + c * Rq[i]);
+                        }
+                        for (let i = 0; i < n; i++) { Rp[i] = get(T, p, i); Rq[i] = get(T, q, i); }
+                        for (let i = 0; i < n; i++) {
+                            set(T, p, i, c * Rp[i] - s * Rq[i]);
+                            set(T, q, i, s * Rp[i] + c * Rq[i]);
+                        }
+                        // Accumulate eigenvectors
+                        for (let i = 0; i < n; i++) {
+                            const vip = get(V, i, p), viq = get(V, i, q);
+                            set(V, i, p, c * vip - s * viq);
+                            set(V, i, q, s * vip + c * viq);
+                        }
+                    }
+                }
+            }
+
+            const values = new Float64Array(n);
+            for (let i = 0; i < n; i++) values[i] = get(T, i, i);
+
+            // Sort descending by eigenvalue
+            const idx = Array.from({length: n}, (_, i) => i);
+            idx.sort((a, b) => values[b] - values[a]);
+            const sortedVals = new Float64Array(n);
+            const sortedVecs = zeros(n, n);
+            for (let i = 0; i < n; i++) {
+                sortedVals[i] = values[idx[i]];
+                for (let j = 0; j < n; j++) set(sortedVecs, j, i, get(V, j, idx[i]));
+            }
+
+            return { values: sortedVals, vectors: sortedVecs };
+        }
+
+        // Create matrix from 2D array
+        function fromArray(arr) {
+            const r = arr.length, c = arr[0].length;
+            const m = zeros(r, c);
+            for (let i = 0; i < r; i++)
+                for (let j = 0; j < c; j++) set(m, i, j, arr[i][j]);
+            return m;
+        }
+
+        // Matrix-vector multiply: A * v -> result vector
+        function matvec(A, v) {
+            const out = new Float64Array(A.rows);
+            for (let i = 0; i < A.rows; i++) {
+                let sum = 0;
+                for (let j = 0; j < A.cols; j++) sum += get(A, i, j) * v[j];
+                out[i] = sum;
+            }
+            return out;
+        }
+
+        return {
+            zeros, eye, get, set, clone, multiply, transpose, cholesky,
+            solveLower, solveUpper, solve, invert, eigenSymmetric,
+            fromArray, matvec
+        };
+    })();
+
+    // --- Stats ---
+    const stats = (() => {
+        const SQRT2PI = Math.sqrt(2 * Math.PI);
+        const LN2PI_HALF = 0.5 * Math.log(2 * Math.PI);
+
+        function normalPdf(x, mu, sigma) {
+            mu = mu ?? 0; sigma = sigma ?? 1;
+            const z = (x - mu) / sigma;
+            return Math.exp(-0.5 * z * z) / (sigma * SQRT2PI);
+        }
+
+        function normalLogPdf(x, mu, sigma) {
+            mu = mu ?? 0; sigma = sigma ?? 1;
+            const z = (x - mu) / sigma;
+            return -0.5 * z * z - Math.log(sigma) - LN2PI_HALF;
+        }
+
+        // Abramowitz & Stegun approximation
+        function normalCdf(x) {
+            const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429;
+            const p = 0.3275911;
+            const sign = x < 0 ? -1 : 1;
+            const ax = Math.abs(x) / Math.SQRT2;
+            const t = 1 / (1 + p * ax);
+            const y = 1 - ((((a5*t + a4)*t + a3)*t + a2)*t + a1)*t * Math.exp(-ax*ax);
+            return 0.5 * (1 + sign * y);
+        }
+
+        // Inverse normal CDF (Beasley-Springer-Moro)
+        function normalQuantile(p) {
+            if (p <= 0) return -Infinity;
+            if (p >= 1) return Infinity;
+            if (Math.abs(p - 0.5) < 1e-15) return 0;
+            const a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+                        1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00];
+            const b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+                        6.680131188771972e+01, -1.328068155288572e+01];
+            const c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+                        -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00];
+            const d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+                        3.754408661907416e+00];
+            const pLow = 0.02425, pHigh = 1 - pLow;
+            let q, r;
+            if (p < pLow) {
+                q = Math.sqrt(-2 * Math.log(p));
+                return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
+                       ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
+            } else if (p <= pHigh) {
+                q = p - 0.5; r = q * q;
+                return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q /
+                       (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1);
+            } else {
+                q = Math.sqrt(-2 * Math.log(1 - p));
+                return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) /
+                        ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
+            }
+        }
+
+        // Log-gamma (Lanczos approximation)
+        function logGamma(x) {
+            const c = [76.18009172947146, -86.50532032941677, 24.01409824083091,
+                       -1.231739572450155, 0.001208650973866179, -0.000005395239384953];
+            let y = x, tmp = x + 5.5;
+            tmp -= (x + 0.5) * Math.log(tmp);
+            let ser = 1.000000000190015;
+            for (let j = 0; j < 6; j++) ser += c[j] / (++y);
+            return -tmp + Math.log(2.5066282746310005 * ser / x);
+        }
+
+        // Regularized incomplete beta function (Lentz continued fraction)
+        function regIncBeta(a, b, x) {
+            if (x < 0 || x > 1) return 0;
+            if (x === 0) return 0;
+            if (x === 1) return 1;
+            const lbeta = logGamma(a) + logGamma(b) - logGamma(a + b);
+            const front = Math.exp(Math.log(x) * a + Math.log(1 - x) * b - lbeta);
+            // Use symmetry relation to ensure continued fraction converges
+            if (x < (a + 1) / (a + b + 2)) {
+                return front * _betaCfLentz(a, b, x) / a;
+            } else {
+                return 1 - front * _betaCfLentz(b, a, 1 - x) / b;
+            }
+        }
+
+        // Lentz method for continued fraction evaluation of incomplete beta
+        function _betaCfLentz(a, b, x) {
+            const FPMIN = 1e-300;
+            const maxIter = 200;
+            const qab = a + b, qap = a + 1, qam = a - 1;
+            let c = 1, d = 1 - qab * x / qap;
+            if (Math.abs(d) < FPMIN) d = FPMIN;
+            d = 1 / d;
+            let h = d;
+            for (let m = 1; m <= maxIter; m++) {
+                const m2 = 2 * m;
+                // Even step
+                let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+                d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+                c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+                d = 1 / d; h *= d * c;
+                // Odd step
+                aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+                d = 1 + aa * d; if (Math.abs(d) < FPMIN) d = FPMIN;
+                c = 1 + aa / c; if (Math.abs(c) < FPMIN) c = FPMIN;
+                d = 1 / d;
+                const del = d * c;
+                h *= del;
+                if (Math.abs(del - 1) < 3e-7) break;
+            }
+            return h;
+        }
+
+        // t-distribution CDF via regularized incomplete beta
+        function tCdf(t, df) {
+            const x = df / (df + t * t);
+            const ib = regIncBeta(df / 2, 0.5, x);
+            return t >= 0 ? 1 - 0.5 * ib : 0.5 * ib;
+        }
+
+        // t-distribution quantile via bisection on tCdf
+        function tQuantile(p, df) {
+            if (p <= 0) return -Infinity;
+            if (p >= 1) return Infinity;
+            let lo = -100, hi = 100;
+            for (let i = 0; i < 100; i++) {
+                const mid = (lo + hi) / 2;
+                if (tCdf(mid, df) < p) lo = mid; else hi = mid;
+            }
+            return (lo + hi) / 2;
+        }
+
+        // Regularized lower incomplete gamma (series expansion)
+        function regLowerGamma(a, x) {
+            if (x < 0) return 0;
+            if (x === 0) return 0;
+            let sum = 0, term = 1 / a;
+            for (let n = 1; n < 300; n++) {
+                term *= x / (a + n);
+                sum += term;
+                if (Math.abs(term) < 1e-14) break;
+            }
+            return (1 / a + sum) * Math.exp(-x + a * Math.log(x) - logGamma(a));
+        }
+
+        // Chi-squared CDF via regularized lower incomplete gamma
+        function chi2Cdf(x, k) {
+            if (x <= 0) return 0;
+            return regLowerGamma(k / 2, x / 2);
+        }
+
+        // Kernel density estimation (Gaussian kernel)
+        function kde(data, bandwidth, grid) {
+            const n = data.length;
+            const h = bandwidth ?? (1.06 * std(data) * Math.pow(n, -0.2));
+            return grid.map(x => {
+                let sum = 0;
+                for (let i = 0; i < n; i++) sum += normalPdf((x - data[i]) / h);
+                return sum / (n * h);
+            });
+        }
+
+        function mean(arr) {
+            let s = 0;
+            for (let i = 0; i < arr.length; i++) s += arr[i];
+            return s / arr.length;
+        }
+        function variance(arr) {
+            const m = mean(arr);
+            let s = 0;
+            for (let i = 0; i < arr.length; i++) s += (arr[i] - m) * (arr[i] - m);
+            return s / (arr.length - 1);
+        }
+        function std(arr) { return Math.sqrt(variance(arr)); }
+        function quantile(arr, p) {
+            const sorted = Float64Array.from(arr).sort();
+            const idx = p * (sorted.length - 1);
+            const lo = Math.floor(idx), hi = Math.ceil(idx);
+            return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+        }
+
+        return {
+            normalPdf, normalLogPdf, normalCdf, normalQuantile,
+            logGamma, tCdf, tQuantile, chi2Cdf, regIncBeta, regLowerGamma,
+            kde, mean, variance, std, quantile
+        };
+    })();
+
+    // --- Optimization ---
+    const optim = (() => {
+        // Newton-Raphson: minimize f(x) given f'(x) and f''(x)
+        // Returns x that makes f'(x)=0
+        function newtonRaphson(fprime, f2prime, x0, opts) {
+            const maxIter = (opts && opts.maxIter) ?? 100;
+            const tol = (opts && opts.tol) ?? 1e-8;
+            let x = x0;
+            for (let i = 0; i < maxIter; i++) {
+                const g = fprime(x);
+                const h = f2prime(x);
+                if (Math.abs(h) < 1e-30) break;
+                const dx = g / h;
+                x -= dx;
+                if (Math.abs(dx) < tol) break;
+            }
+            return x;
+        }
+
+        // Golden section search: minimize f(x) on [a, b]
+        function goldenSection(f, a, b, opts) {
+            const tol = (opts && opts.tol) ?? 1e-8;
+            const maxIter = (opts && opts.maxIter) ?? 100;
+            const gr = (Math.sqrt(5) - 1) / 2;
+            let c = b - gr * (b - a);
+            let d = a + gr * (b - a);
+            for (let i = 0; i < maxIter; i++) {
+                if (Math.abs(b - a) < tol) break;
+                if (f(c) < f(d)) { b = d; } else { a = c; }
+                c = b - gr * (b - a);
+                d = a + gr * (b - a);
+            }
+            return (a + b) / 2;
+        }
+
+        return { newtonRaphson, goldenSection };
+    })();
+
+    return { random, linalg, stats, optim };
+})();
+</script>
+
+<!-- ============================================================
+     SCRIPT 2: DataLayer
+     ============================================================ -->
+<script>
+/* === DATA LAYER === */
+const DataLayer = (() => {
+    const DATASETS = {
+        colchicine: {
+            name: 'Colchicine / ACS',
+            format: 'rr_ci',
+            trials: [
+                {trial_name:'COLCOT', rr:0.77, ci_lower:0.61, ci_upper:0.96, n:4742, population:'post-MI'},
+                {trial_name:'CLEAR SYNERGY', rr:0.98, ci_lower:0.84, ci_upper:1.13, n:7062, population:'MI'},
+                {trial_name:'COPS', rr:0.65, ci_lower:0.38, ci_upper:1.09, n:795, population:'ACS'},
+                {trial_name:'LoDoCo2', rr:0.71, ci_lower:0.58, ci_upper:0.87, n:5522, population:'CCD'}
+            ]
+        },
+        sglt2: {
+            name: 'SGLT2i / HF',
+            format: 'rr_ci',
+            trials: [
+                {trial_name:'DAPA-HF', rr:0.74, ci_lower:0.65, ci_upper:0.85, n:4744, population:'HFrEF'},
+                {trial_name:'EMPEROR-Reduced', rr:0.75, ci_lower:0.65, ci_upper:0.86, n:3730, population:'HFrEF'},
+                {trial_name:'EMPEROR-Preserved', rr:0.79, ci_lower:0.69, ci_upper:0.90, n:5988, population:'HFpEF'},
+                {trial_name:'DELIVER', rr:0.82, ci_lower:0.73, ci_upper:0.92, n:6263, population:'HFpEF'}
+            ]
+        },
+        nma_synthetic: {
+            name: 'Synthetic NMA (1000 trials)',
+            format: 'nma',
+            trials: null // Generated on demand
+        }
+    };
+
+    let activeData = null;
+
+    function generateSyntheticNMA() {
+        MathCore.random.seed(777);
+        const trials = [];
+        for (let i = 0; i < 1000; i++) {
+            const tt = MathCore.random.uniform();
+            const year = 2000 + Math.floor(MathCore.random.uniform() * 31);
+            const age = 60 + MathCore.random.normal(0, 12);
+            const clampedAge = Math.max(30, Math.min(90, age));
+
+            const true_1v0 = -0.3 + (year - 2015) * 0.005 + (clampedAge - 60) * 0.002;
+            const true_2v0 = -0.4 + (year - 2015) * 0.004 + (clampedAge - 60) * 0.001;
+            const vi = 1 / (Math.max(100, Math.floor(MathCore.random.uniform() * 5000)) * 0.1);
+
+            let t1, t2, yi;
+            if (tt < 0.45) {
+                t1 = 0; t2 = 1;
+                yi = true_1v0 + MathCore.random.normal(0, Math.sqrt(vi + 0.02));
+            } else if (tt < 0.90) {
+                t1 = 0; t2 = 2;
+                yi = true_2v0 + MathCore.random.normal(0, Math.sqrt(vi + 0.02));
+            } else {
+                t1 = 1; t2 = 2;
+                yi = (true_2v0 - true_1v0) + MathCore.random.normal(0, Math.sqrt(vi + 0.02));
+            }
+            trials.push({trial_name: 'NCT' + String(i+1).padStart(8,'0'), t1, t2, yi, vi, year, mean_age: clampedAge});
+        }
+        return trials;
+    }
+
+    function convertRrToYiVi(trials) {
+        return trials.map(t => {
+            const yi = Math.log(t.rr);
+            const se = (Math.log(t.ci_upper) - Math.log(t.ci_lower)) / (2 * 1.96);
+            const vi = se * se;
+            return Object.assign({}, t, {yi, vi});
+        });
+    }
+
+    function detectFormat(trials) {
+        if (trials.length === 0) return 'unknown';
+        const keys = Object.keys(trials[0]);
+        if (keys.includes('t1') && keys.includes('t2')) return 'nma';
+        if (keys.includes('rr') && keys.includes('ci_lower')) return 'rr_ci';
+        if (keys.includes('yi') && keys.includes('vi')) return 'yi_vi';
+        return 'unknown';
+    }
+
+    function parseCSV(text) {
+        const lines = text.trim().split('\n');
+        const headers = lines[0].split(',').map(h => h.trim());
+        const rows = [];
+        for (let i = 1; i < lines.length; i++) {
+            const vals = lines[i].split(',').map(v => v.trim());
+            if (vals.length !== headers.length) continue;
+            const row = {};
+            for (let j = 0; j < headers.length; j++) {
+                const num = parseFloat(vals[j]);
+                row[headers[j]] = isNaN(num) ? vals[j] : num;
+            }
+            rows.push(row);
+        }
+        return rows;
+    }
+
+    function load(datasetKey) {
+        const ds = DATASETS[datasetKey];
+        if (!ds) throw new Error('Unknown dataset: ' + datasetKey);
+        let trials = ds.trials;
+        if (datasetKey === 'nma_synthetic' && !trials) {
+            trials = generateSyntheticNMA();
+            DATASETS.nma_synthetic.trials = trials;
+        }
+        const format = ds.format;
+        // Convert rr/ci to yi/vi for uniformity
+        if (format === 'rr_ci') {
+            activeData = { name: ds.name, format, trials, trialsYiVi: convertRrToYiVi(trials) };
+        } else {
+            activeData = { name: ds.name, format, trials, trialsYiVi: trials };
+        }
+        return activeData;
+    }
+
+    function loadCSV(text) {
+        const trials = parseCSV(text);
+        const format = detectFormat(trials);
+        if (format === 'unknown') throw new Error('Unrecognized CSV format. Need rr/ci_lower/ci_upper or yi/vi or t1/t2/yi/vi columns.');
+        if (format === 'rr_ci') {
+            activeData = { name: 'Custom Upload', format, trials, trialsYiVi: convertRrToYiVi(trials) };
+        } else {
+            activeData = { name: 'Custom Upload', format, trials, trialsYiVi: trials };
+        }
+        return activeData;
+    }
+
+    function getActive() { return activeData; }
+
+    return { load, loadCSV, getActive, DATASETS, detectFormat };
+})();
+</script>
+
+<!-- ============================================================
+     SCRIPT 3: App Controller
+     ============================================================ -->
+<script>
+/* === APP CONTROLLER === */
+const App = (() => {
+    function init() {
+        // Load default dataset
+        DataLayer.load('colchicine');
+        updateStatus('Loaded: Colchicine / ACS (4 trials)');
+
+        // Dataset selector
+        document.getElementById('dataset-select').addEventListener('change', function(e) {
+            const key = e.target.value;
+            if (key === 'custom') {
+                document.getElementById('file-upload').click();
+                return;
+            }
+            const data = DataLayer.load(key);
+            updateStatus('Loaded: ' + data.name + ' (' + data.trials.length + ' trials, format: ' + data.format + ')');
+            if (typeof Limb1 !== 'undefined' && Limb1.onDataChange) Limb1.onDataChange(data);
+        });
+
+        // File upload
+        document.getElementById('file-upload').addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function(evt) {
+                try {
+                    const data = DataLayer.loadCSV(evt.target.result);
+                    updateStatus('Loaded: ' + file.name + ' (' + data.trials.length + ' trials, format: ' + data.format + ')');
+                    if (typeof Limb1 !== 'undefined' && Limb1.onDataChange) Limb1.onDataChange(data);
+                } catch (err) {
+                    updateStatus('Error: ' + err.message);
+                }
+            };
+            reader.readAsText(file);
+        });
+
+        // Tab switching
+        document.querySelectorAll('.tab-btn:not(.disabled)').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('.tab-btn').forEach(function(b) {
+                    b.classList.remove('active');
+                    b.setAttribute('aria-selected', 'false');
+                });
+                document.querySelectorAll('.tab-panel').forEach(function(p) {
+                    p.classList.remove('active');
+                });
+                btn.classList.add('active');
+                btn.setAttribute('aria-selected', 'true');
+                const tabId = btn.dataset.tab;
+                document.getElementById('panel-' + tabId).classList.add('active');
+            });
+        });
+    }
+
+    function updateStatus(msg) {
+        document.getElementById('status-text').textContent = msg;
+    }
+
+    return { init, updateStatus };
+})();
+
+document.addEventListener('DOMContentLoaded', function() { App.init(); });
+</script>
+
+<!-- ============================================================
+     SCRIPT 4: TestRunner + all 17 tests
+     ============================================================ -->
+<script>
+/* === TEST HARNESS === */
+const TestRunner = (() => {
+    const tests = [];
+    function register(name, fn) { tests.push({name, fn}); }
+    function run() {
+        const el = document.getElementById('test-output');
+        el.style.display = 'block';
+        el.innerHTML = '';
+        let pass = 0, fail = 0;
+        for (const t of tests) {
+            try {
+                t.fn();
+                el.innerHTML += '<div class="test-pass">PASS: ' + t.name + '</div>';
+                pass++;
+            } catch(e) {
+                el.innerHTML += '<div class="test-fail">FAIL: ' + t.name + ' \u2014 ' + e.message + '</div>';
+                fail++;
+            }
+        }
+        el.innerHTML += '<div style="margin-top:8px;color:var(--text)">Total: ' + (pass+fail) + ' | Pass: ' + pass + ' | Fail: ' + fail + '</div>';
+        document.getElementById('status-text').textContent = 'Tests: ' + pass + ' passed, ' + fail + ' failed';
+    }
+    return { register, run };
+})();
+
+document.getElementById('btn-run-tests').addEventListener('click', function() { TestRunner.run(); });
+
+// ---- T1: Seeded PRNG determinism ----
+TestRunner.register('PRNG determinism', function() {
+    MathCore.random.seed(42);
+    const a = MathCore.random.uniform();
+    MathCore.random.seed(42);
+    const b = MathCore.random.uniform();
+    if (Math.abs(a - b) > 1e-15) throw new Error(a + ' !== ' + b);
+});
+
+// ---- T2: Normal distribution mean (LLN) ----
+TestRunner.register('Normal mean ~0', function() {
+    MathCore.random.seed(123);
+    let sum = 0;
+    for (let i = 0; i < 10000; i++) sum += MathCore.random.normal();
+    const mean = sum / 10000;
+    if (Math.abs(mean) > 0.05) throw new Error('Mean ' + mean + ' too far from 0');
+});
+
+// ---- T3: Matrix multiply identity ----
+TestRunner.register('Matrix multiply A*I = A', function() {
+    const A = MathCore.linalg.fromArray([[1,2],[3,4]]);
+    const I = MathCore.linalg.eye(2);
+    const R = MathCore.linalg.multiply(A, I);
+    if (Math.abs(MathCore.linalg.get(R, 0, 0) - 1) > 1e-10) throw new Error('Failed at [0,0]');
+    if (Math.abs(MathCore.linalg.get(R, 1, 1) - 4) > 1e-10) throw new Error('Failed at [1,1]');
+});
+
+// ---- T4: Cholesky decomposition ----
+TestRunner.register('Cholesky L*L^T = A', function() {
+    const A = MathCore.linalg.fromArray([[4,2],[2,3]]);
+    const L = MathCore.linalg.cholesky(A);
+    const LT = MathCore.linalg.transpose(L);
+    const R = MathCore.linalg.multiply(L, LT);
+    if (Math.abs(MathCore.linalg.get(R, 0, 0) - 4) > 1e-10) throw new Error('R[0,0] = ' + MathCore.linalg.get(R,0,0));
+    if (Math.abs(MathCore.linalg.get(R, 0, 1) - 2) > 1e-10) throw new Error('R[0,1] = ' + MathCore.linalg.get(R,0,1));
+    if (Math.abs(MathCore.linalg.get(R, 1, 1) - 3) > 1e-10) throw new Error('R[1,1] = ' + MathCore.linalg.get(R,1,1));
+});
+
+// ---- T5: Eigendecomposition 2x2 ----
+TestRunner.register('Eigen symmetric 2x2', function() {
+    const A = MathCore.linalg.fromArray([[2,1],[1,2]]);
+    const res = MathCore.linalg.eigenSymmetric(A);
+    if (Math.abs(res.values[0] - 3) > 1e-8) throw new Error('lambda0=' + res.values[0] + ' expected 3');
+    if (Math.abs(res.values[1] - 1) > 1e-8) throw new Error('lambda1=' + res.values[1] + ' expected 1');
+});
+
+// ---- T6: Solve Ax=b via Cholesky ----
+TestRunner.register('Solve Ax=b', function() {
+    const A = MathCore.linalg.fromArray([[4,2],[2,3]]);
+    const b = [8, 7];
+    const x = MathCore.linalg.solve(A, b);
+    const Ax = MathCore.linalg.matvec(A, x);
+    if (Math.abs(Ax[0] - 8) > 1e-8) throw new Error('Ax[0]=' + Ax[0]);
+    if (Math.abs(Ax[1] - 7) > 1e-8) throw new Error('Ax[1]=' + Ax[1]);
+});
+
+// ---- T7: LHS samples in [0,1] ----
+TestRunner.register('LHS samples in [0,1]', function() {
+    const samples = MathCore.random.lhs(100, 3, 42);
+    for (let i = 0; i < 300; i++) {
+        if (samples[i] < 0 || samples[i] > 1) throw new Error('Sample ' + i + ' = ' + samples[i]);
+    }
+});
+
+// ---- T8: Gamma distribution mean ----
+TestRunner.register('Gamma(2,1) mean ~2', function() {
+    MathCore.random.seed(99);
+    let sum = 0;
+    for (let i = 0; i < 5000; i++) sum += MathCore.random.gamma(2, 1);
+    const mean = sum / 5000;
+    if (Math.abs(mean - 2) > 0.15) throw new Error('Mean ' + mean + ' expected ~2');
+});
+
+// ---- T9: Normal CDF symmetry ----
+TestRunner.register('Normal CDF(0) = 0.5', function() {
+    const p = MathCore.stats.normalCdf(0);
+    if (Math.abs(p - 0.5) > 1e-6) throw new Error('CDF(0) = ' + p);
+});
+
+// ---- T10: Normal quantile inverse ----
+TestRunner.register('Normal quantile inverse', function() {
+    const z = MathCore.stats.normalQuantile(0.975);
+    if (Math.abs(z - 1.96) > 0.01) throw new Error('z = ' + z + ', expected ~1.96');
+});
+
+// ---- T11: t-distribution quantile ----
+TestRunner.register('t-quantile(0.975, 10) ~ 2.228', function() {
+    const t = MathCore.stats.tQuantile(0.975, 10);
+    if (Math.abs(t - 2.228) > 0.05) throw new Error('t = ' + t);
+});
+
+// ---- T12: Golden section finds sqrt(2) ----
+TestRunner.register('Newton-Raphson sqrt(2)', function() {
+    const result = MathCore.optim.goldenSection(function(x) { return (x*x - 2)*(x*x - 2); }, 1, 2);
+    if (Math.abs(result - Math.SQRT2) > 0.001) throw new Error('Got ' + result);
+});
+
+// ---- T13: Load colchicine dataset ----
+TestRunner.register('Load colchicine dataset', function() {
+    const d = DataLayer.load('colchicine');
+    if (d.trials.length !== 4) throw new Error('Expected 4 trials, got ' + d.trials.length);
+    if (d.format !== 'rr_ci') throw new Error('Expected rr_ci format, got ' + d.format);
+});
+
+// ---- T14: Convert RR/CI to yi/vi ----
+TestRunner.register('RR to yi/vi conversion', function() {
+    const d = DataLayer.load('colchicine');
+    const colcot = d.trialsYiVi[0]; // COLCOT: rr=0.77
+    if (Math.abs(colcot.yi - Math.log(0.77)) > 1e-10) throw new Error('yi = ' + colcot.yi);
+    if (!(colcot.vi > 0)) throw new Error('vi must be positive, got ' + colcot.vi);
+});
+
+// ---- T15: Detect NMA format ----
+TestRunner.register('Detect NMA format', function() {
+    const fmt = DataLayer.detectFormat([{t1:0, t2:1, yi:-0.3, vi:0.05}]);
+    if (fmt !== 'nma') throw new Error('Expected nma, got ' + fmt);
+});
+
+// ---- T16: CSV parsing ----
+TestRunner.register('Parse CSV string', function() {
+    const csv = 'trial_name,rr,ci_lower,ci_upper\nA,0.8,0.7,0.91';
+    const d = DataLayer.loadCSV(csv);
+    if (d.trials.length !== 1) throw new Error('Expected 1 trial, got ' + d.trials.length);
+    if (d.trials[0].rr !== 0.8) throw new Error('RR = ' + d.trials[0].rr);
+});
+
+// ---- T17: Synthetic NMA generation (deterministic) ----
+TestRunner.register('Synthetic NMA 1000 trials', function() {
+    const d = DataLayer.load('nma_synthetic');
+    if (d.trials.length !== 1000) throw new Error('Expected 1000, got ' + d.trials.length);
+    if (d.format !== 'nma') throw new Error('Expected nma format, got ' + d.format);
+});
+</script>
+
+</body>
+</html>
