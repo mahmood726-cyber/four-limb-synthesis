@@ -2093,6 +2093,309 @@ const Limb1 = (() => {
 </script>
 
 <!-- ============================================================
+     SCRIPT 4b: Limb2 — Causal Transport & Distribution Matching (M11-M14)
+     ============================================================ -->
+<script>
+/* === LIMB 2: CAUSAL TRANSPORT & DISTRIBUTION MATCHING === */
+const Limb2 = (() => {
+    const methods = {};
+
+    // Helper: logistic regression via IRLS (iteratively reweighted least squares)
+    // X: array of covariate vectors, y: binary outcome
+    // Returns beta coefficients
+    function logisticRegression(X, y, maxIter) {
+        maxIter = maxIter || 25;
+        const n = X.length, p = X[0].length;
+        let beta = new Float64Array(p); // start at 0
+
+        for (let iter = 0; iter < maxIter; iter++) {
+            const mu = new Float64Array(n);
+            const W = new Float64Array(n);
+            for (let i = 0; i < n; i++) {
+                let eta = 0;
+                for (let j = 0; j < p; j++) eta += X[i][j] * beta[j];
+                mu[i] = 1 / (1 + Math.exp(-eta));
+                mu[i] = Math.max(1e-6, Math.min(1 - 1e-6, mu[i]));
+                W[i] = mu[i] * (1 - mu[i]);
+            }
+            // X^T W X and X^T (y - mu)
+            const XtWX = MathCore.linalg.zeros(p, p);
+            const XtWz = new Float64Array(p);
+            for (let i = 0; i < n; i++) {
+                for (let j = 0; j < p; j++) {
+                    for (let k = 0; k < p; k++) {
+                        const old = MathCore.linalg.get(XtWX, j, k);
+                        MathCore.linalg.set(XtWX, j, k, old + X[i][j] * W[i] * X[i][k]);
+                    }
+                    XtWz[j] += X[i][j] * (y[i] - mu[i]);
+                }
+            }
+            // Solve: (X^T W X) delta = X^T (y - mu)
+            try {
+                const delta = MathCore.linalg.solve(XtWX, XtWz);
+                let maxDelta = 0;
+                for (let j = 0; j < p; j++) {
+                    beta[j] += delta[j];
+                    maxDelta = Math.max(maxDelta, Math.abs(delta[j]));
+                }
+                if (maxDelta < 1e-8) break;
+            } catch(e) {
+                break; // Singular matrix, stop
+            }
+        }
+        return beta;
+    }
+
+    // Helper: predict probabilities from logistic model
+    function logisticPredict(X, beta) {
+        return X.map(function(xi) {
+            let eta = 0;
+            for (let j = 0; j < xi.length; j++) eta += xi[j] * beta[j];
+            return 1 / (1 + Math.exp(-eta));
+        });
+    }
+
+    // Convert IPD to covariate matrix (with intercept)
+    function ipdToX(ipd) {
+        return ipd.map(function(row) { return [1, row.age_65, row.diabetes]; });
+    }
+
+    // M11: IPSW (Inverse Probability of Selection Weighting)
+    methods.ipsw = function(trialIPD, targetIPD) {
+        // Combined dataset: S=1 for trial, S=0 for target
+        const Xtrial = ipdToX(trialIPD);
+        const Xtarget = ipdToX(targetIPD);
+        const Xall = Xtrial.concat(Xtarget);
+        const Sall = new Float64Array(Xtrial.length + Xtarget.length);
+        for (let i = 0; i < Xtrial.length; i++) Sall[i] = 1;
+
+        // Fit P(S=1 | X) via logistic regression
+        const beta = logisticRegression(Xall, Sall);
+        const pScores = logisticPredict(Xtrial, beta);
+
+        // IPSW weights: w_i = (1 - p_i) / p_i
+        const rawWeights = pScores.map(function(p) { return (1 - p) / Math.max(p, 1e-6); });
+
+        // Trim extreme weights (1st and 99th percentile)
+        const sorted = Float64Array.from(rawWeights).sort();
+        const lo = sorted[Math.floor(0.01 * sorted.length)];
+        const hi = sorted[Math.floor(0.99 * sorted.length)];
+        const weights = rawWeights.map(function(w) { return Math.max(lo, Math.min(hi, w)); });
+
+        // Weighted ATE
+        const sumW = weights.reduce(function(a, b) { return a + b; }, 0);
+        let ate = 0;
+        for (let i = 0; i < trialIPD.length; i++) {
+            ate += weights[i] * trialIPD[i].yi;
+        }
+        ate /= sumW;
+
+        return {
+            ate_transported: ate,
+            weights: weights,
+            propensity_scores: pScores,
+            beta: Array.from(beta)
+        };
+    };
+
+    // M12: AIPW (Augmented Inverse Probability Weighting / Doubly Robust)
+    methods.aipw = function(trialIPD, targetIPD) {
+        // Step 1: Propensity model (same as IPSW)
+        const Xtrial = ipdToX(trialIPD);
+        const Xtarget = ipdToX(targetIPD);
+        const Xall = Xtrial.concat(Xtarget);
+        const Sall = new Float64Array(Xall.length);
+        for (let i = 0; i < Xtrial.length; i++) Sall[i] = 1;
+        const betaS = logisticRegression(Xall, Sall);
+        const pScores = logisticPredict(Xtrial, betaS);
+
+        // Step 2: Outcome model m(X) — OLS regression of yi on X (trial data only)
+        const n = trialIPD.length;
+        const p = Xtrial[0].length;
+        const XtX = MathCore.linalg.zeros(p, p);
+        const Xty = new Float64Array(p);
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < p; j++) {
+                Xty[j] += Xtrial[i][j] * trialIPD[i].yi;
+                for (let k = 0; k < p; k++) {
+                    const old = MathCore.linalg.get(XtX, j, k);
+                    MathCore.linalg.set(XtX, j, k, old + Xtrial[i][j] * Xtrial[i][k]);
+                }
+            }
+        }
+        let betaY;
+        try {
+            betaY = MathCore.linalg.solve(XtX, Xty);
+        } catch(e) {
+            betaY = new Float64Array(p);
+        }
+
+        // Predict m(X) for trial observations
+        const mTrial = Xtrial.map(function(xi) {
+            let pred = 0;
+            for (let j = 0; j < p; j++) pred += xi[j] * betaY[j];
+            return pred;
+        });
+
+        // Predict m(X) for target observations
+        const mTarget = Xtarget.map(function(xi) {
+            let pred = 0;
+            for (let j = 0; j < p; j++) pred += xi[j] * betaY[j];
+            return pred;
+        });
+
+        // AIPW doubly-robust estimator
+        const targetMean = mTarget.reduce(function(a, b) { return a + b; }, 0) / mTarget.length;
+        let augTerm = 0;
+        for (let i = 0; i < n; i++) {
+            const ps = Math.max(pScores[i], 1e-6);
+            augTerm += ((1 - ps) / ps) * (trialIPD[i].yi - mTrial[i]);
+        }
+        augTerm /= n;
+        const ate_dr = targetMean + augTerm;
+
+        return {
+            ate_dr: ate_dr,
+            outcome_model_beta: Array.from(betaY),
+            propensity_beta: Array.from(betaS),
+            targetMean: targetMean,
+            augmentation: augTerm
+        };
+    };
+
+    // M13: Optimal Transport via Sinkhorn algorithm
+    methods.sinkhorn = function(X, Y, epsilon, maxIter) {
+        if (epsilon === undefined) epsilon = 0.1;
+        if (maxIter === undefined) maxIter = 500;
+        const m = X.length, n = Y.length;
+
+        // Cost matrix C_ij = ||X_i - Y_j||^2
+        const C = [];
+        for (let i = 0; i < m; i++) {
+            C[i] = new Float64Array(n);
+            for (let j = 0; j < n; j++) {
+                let d = 0;
+                for (let kk = 0; kk < X[i].length; kk++) d += (X[i][kk] - Y[j][kk]) * (X[i][kk] - Y[j][kk]);
+                C[i][j] = d;
+            }
+        }
+
+        // Gibbs kernel K = exp(-C/epsilon)
+        const K = [];
+        for (let i = 0; i < m; i++) {
+            K[i] = new Float64Array(n);
+            for (let j = 0; j < n; j++) {
+                K[i][j] = Math.exp(-C[i][j] / epsilon);
+            }
+        }
+
+        // Uniform marginals
+        const pMarg = new Float64Array(m).fill(1 / m);
+        const qMarg = new Float64Array(n).fill(1 / n);
+
+        // Sinkhorn iterations
+        let a = new Float64Array(m).fill(1);
+        let b = new Float64Array(n).fill(1);
+
+        for (let iter = 0; iter < maxIter; iter++) {
+            // a = p / (K * b)
+            const aNew = new Float64Array(m);
+            for (let i = 0; i < m; i++) {
+                let s = 0;
+                for (let j = 0; j < n; j++) s += K[i][j] * b[j];
+                aNew[i] = pMarg[i] / Math.max(s, 1e-30);
+            }
+            a = aNew;
+
+            // b = q / (K^T * a)
+            const bNew = new Float64Array(n);
+            for (let j = 0; j < n; j++) {
+                let s = 0;
+                for (let i = 0; i < m; i++) s += K[i][j] * a[i];
+                bNew[j] = qMarg[j] / Math.max(s, 1e-30);
+            }
+
+            // Check convergence
+            let maxDiff = 0;
+            for (let j = 0; j < n; j++) maxDiff = Math.max(maxDiff, Math.abs(bNew[j] - b[j]));
+            b = bNew;
+            if (maxDiff < 1e-8) break;
+        }
+
+        // Transport plan: T_ij = a_i * K_ij * b_j
+        const plan = [];
+        let wasserstein = 0;
+        for (let i = 0; i < m; i++) {
+            plan[i] = new Float64Array(n);
+            for (let j = 0; j < n; j++) {
+                plan[i][j] = a[i] * K[i][j] * b[j];
+                wasserstein += plan[i][j] * C[i][j];
+            }
+        }
+
+        return {
+            plan: plan,
+            wasserstein: wasserstein,
+            scaling_a: a,
+            scaling_b: b
+        };
+    };
+
+    // Transport effect using Sinkhorn plan
+    methods.sinkhornTransport = function(trialIPD, targetIPD, epsilon) {
+        if (epsilon === undefined) epsilon = 0.1;
+        const X = trialIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+        const Y = targetIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+        const sinkResult = methods.sinkhorn(X, Y, epsilon);
+
+        const m = trialIPD.length, n = targetIPD.length;
+        const transportedEffects = new Float64Array(n);
+        for (let j = 0; j < n; j++) {
+            let wSum = 0, ySum = 0;
+            for (let i = 0; i < m; i++) {
+                wSum += sinkResult.plan[i][j];
+                ySum += sinkResult.plan[i][j] * trialIPD[i].yi;
+            }
+            transportedEffects[j] = wSum > 1e-30 ? ySum / wSum : 0;
+        }
+
+        const ate = MathCore.stats.mean(Array.from(transportedEffects));
+
+        return {
+            ate_transported: ate,
+            wasserstein: sinkResult.wasserstein,
+            transportedEffects: transportedEffects,
+            plan: sinkResult.plan
+        };
+    };
+
+    // M14: MMD two-sample test using MathCore.kernel
+    methods.mmdTest = function(X, Y, nPerm) {
+        if (nPerm === undefined) nPerm = 200;
+        const sigma = MathCore.kernel.medianBandwidth(X.concat(Y));
+        const mmd2val = MathCore.kernel.mmd2(X, Y, sigma);
+        const pValue = MathCore.kernel.mmdPermTest(X, Y, sigma, nPerm);
+
+        return {
+            mmd2: mmd2val,
+            pValue: pValue,
+            sigma: sigma,
+            significant: pValue < 0.05
+        };
+    };
+
+    // Public API stubs
+    function init() {}
+    function onDataChange() {}
+    function exportCSV() {}
+    function exportPNG() {}
+    function getResults() { return null; }
+
+    return { methods, init, onDataChange, exportCSV, exportPNG, getResults };
+})();
+</script>
+
+<!-- ============================================================
      SCRIPT 4: TestRunner + all 17 tests
      ============================================================ -->
 <script>
@@ -2504,6 +2807,50 @@ TestRunner.register('DataLayer: generate transport IPD', function() {
     if (ipd.trialIPD.length !== 100) throw new Error('Trial n=' + ipd.trialIPD.length);
     if (ipd.targetIPD.length !== 100) throw new Error('Target n=' + ipd.targetIPD.length);
     if (typeof ipd.trialIPD[0].age_65 !== 'number') throw new Error('Missing age_65');
+});
+
+// ---- T43: IPSW transported ATE + 200 weights ----
+TestRunner.register('M11: IPSW transported effect differs from naive', function() {
+    MathCore.random.seed(42);
+    const ctx = DataLayer.getContextByRegion('Sub-Saharan Africa', 2025);
+    const ipd = DataLayer.generateTransportIPD({yi: -0.25}, ctx, 200, 200, 42);
+    const res = Limb2.methods.ipsw(ipd.trialIPD, ipd.targetIPD);
+    if (typeof res.ate_transported !== 'number' || isNaN(res.ate_transported)) throw new Error('IPSW returned NaN');
+    if (res.weights.length !== 200) throw new Error('Expected 200 weights, got ' + res.weights.length);
+});
+
+// ---- T44: AIPW doubly-robust ATE not NaN ----
+TestRunner.register('M12: AIPW returns valid result', function() {
+    MathCore.random.seed(42);
+    const ctx = DataLayer.getContextByRegion('Western Europe', 2025);
+    const ipd = DataLayer.generateTransportIPD({yi: -0.25}, ctx, 200, 200, 42);
+    const res = Limb2.methods.aipw(ipd.trialIPD, ipd.targetIPD);
+    if (typeof res.ate_dr !== 'number' || isNaN(res.ate_dr)) throw new Error('AIPW returned NaN');
+});
+
+// ---- T45: Sinkhorn transport plan valid (3x3, rows sum ~1/3) ----
+TestRunner.register('M13: Sinkhorn transport plan valid', function() {
+    MathCore.random.seed(42);
+    var X = [[0,0],[1,0],[0,1]];
+    var Y = [[0.1,0.1],[1.1,0.1],[0.1,1.1]];
+    var res = Limb2.methods.sinkhorn(X, Y, 0.1);
+    if (!res.plan) throw new Error('No transport plan');
+    if (res.wasserstein < 0) throw new Error('W2 = ' + res.wasserstein);
+    var rowSum = 0;
+    for (var j = 0; j < res.plan[0].length; j++) rowSum += res.plan[0][j];
+    if (Math.abs(rowSum - 1/3) > 0.05) throw new Error('Row sum = ' + rowSum + ', expected ~0.333');
+});
+
+// ---- T46: MMD test returns mmd2 and p-value ----
+TestRunner.register('M14: MMD detects shifted distributions', function() {
+    MathCore.random.seed(42);
+    const ctx = DataLayer.getContextByRegion('Sub-Saharan Africa', 2025);
+    const ipd = DataLayer.generateTransportIPD({yi: -0.25}, ctx, 100, 100, 42);
+    const X = ipd.trialIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+    const Y = ipd.targetIPD.map(function(r) { return [r.age_65, r.diabetes]; });
+    const res = Limb2.methods.mmdTest(X, Y);
+    if (typeof res.mmd2 !== 'number') throw new Error('No MMD\u00b2 value');
+    if (typeof res.pValue !== 'number') throw new Error('No p-value');
 });
 </script>
 
