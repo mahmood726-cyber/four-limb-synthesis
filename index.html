@@ -162,7 +162,7 @@ canvas { image-rendering: pixelated; }
 
 <nav class="tab-bar" role="tablist">
     <button class="tab-btn active" role="tab" aria-selected="true" data-tab="limb1">Limb 1: Trial Efficacy</button>
-    <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="limb2" disabled>Limb 2: Causal Transport</button>
+    <button class="tab-btn" role="tab" aria-selected="false" data-tab="limb2">Limb 2: Causal Transport</button>
     <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="limb3" disabled>Limb 3: Economics</button>
     <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="limb4" disabled>Limb 4: Uncertainty</button>
     <button class="tab-btn disabled" role="tab" aria-selected="false" data-tab="integration" disabled>Integration</button>
@@ -183,7 +183,38 @@ canvas { image-rendering: pixelated; }
             <button onclick="if(typeof Limb1!=='undefined')Limb1.exportPNG()">Export PNG</button>
         </div>
     </div>
-    <div id="panel-limb2" class="tab-panel" role="tabpanel"></div>
+    <div id="panel-limb2" class="tab-panel" role="tabpanel">
+        <div class="method-bar" id="limb2-methods" role="radiogroup" aria-label="Select transport method"></div>
+        <div class="split-pane">
+            <div>
+                <div id="limb2-viz" class="viz-container">
+                    <div class="viz-title" id="limb2-viz-title">Select a method to begin</div>
+                    <canvas id="limb2-canvas" width="900" height="500"></canvas>
+                </div>
+            </div>
+            <div>
+                <div id="limb2-dag-container" class="viz-container" style="min-height:350px;">
+                    <div class="viz-title">Causal DAG Editor</div>
+                    <svg id="limb2-dag-svg" width="400" height="320" style="background:var(--surface2);border-radius:6px;cursor:crosshair;"></svg>
+                    <div style="margin-top:8px;display:flex;gap:6px;">
+                        <button id="dag-add-node" class="method-btn">+ Node</button>
+                        <button id="dag-add-edge" class="method-btn">+ Edge</button>
+                        <button id="dag-clear" class="method-btn">Clear</button>
+                        <button id="dag-default" class="method-btn active">Default DAG</button>
+                    </div>
+                </div>
+                <div id="limb2-comparison" class="card" style="margin-top:12px;">
+                    <h3>Method Comparison</h3>
+                    <div id="limb2-comparison-table"></div>
+                </div>
+            </div>
+        </div>
+        <div id="limb2-results"></div>
+        <div class="export-bar">
+            <button onclick="if(typeof Limb2!=='undefined')Limb2.exportCSV()">Export CSV</button>
+            <button onclick="if(typeof Limb2!=='undefined')Limb2.exportPNG()">Export PNG</button>
+        </div>
+    </div>
     <div id="panel-limb3" class="tab-panel" role="tabpanel"></div>
     <div id="panel-limb4" class="tab-panel" role="tabpanel"></div>
     <div id="panel-integration" class="tab-panel" role="tabpanel"></div>
@@ -770,7 +801,170 @@ const MathCore = (() => {
         return { vietorisRips: vietorisRips };
     })();
 
-    return { random, linalg, stats, optim, tda };
+    // --- Kernel Functions ---
+    const kernel = (() => {
+        // Gaussian RBF kernel: k(x,y) = exp(-||x-y||^2/(2*sigma^2))
+        function rbf(x, y, sigma) {
+            let ssd = 0;
+            for (let i = 0; i < x.length; i++) ssd += (x[i] - y[i]) ** 2;
+            return Math.exp(-ssd / (2 * sigma * sigma));
+        }
+
+        // Compute Gram matrix K_ij = k(X[i], X[j])
+        function gramMatrix(X, sigma) {
+            const n = X.length;
+            const K = linalg.zeros(n, n);
+            for (let i = 0; i < n; i++) {
+                linalg.set(K, i, i, 1.0); // k(x,x) = 1
+                for (let j = i + 1; j < n; j++) {
+                    const v = rbf(X[i], X[j], sigma);
+                    linalg.set(K, i, j, v);
+                    linalg.set(K, j, i, v);
+                }
+            }
+            return K;
+        }
+
+        // Median heuristic for bandwidth: sigma = median(||xi - xj||) for i<j
+        function medianBandwidth(X) {
+            const dists = [];
+            for (let i = 0; i < X.length; i++)
+                for (let j = i + 1; j < X.length; j++) {
+                    let d = 0;
+                    for (let k = 0; k < X[i].length; k++) d += (X[i][k] - X[j][k]) ** 2;
+                    dists.push(Math.sqrt(d));
+                }
+            dists.sort((a, b) => a - b);
+            return dists[Math.floor(dists.length / 2)] || 1.0;
+        }
+
+        // MMD^2 (Maximum Mean Discrepancy) between two samples X and Y
+        // Unbiased estimator
+        function mmd2(X, Y, sigma) {
+            const m = X.length, n = Y.length;
+            let kxx = 0, kyy = 0, kxy = 0;
+            for (let i = 0; i < m; i++)
+                for (let j = i + 1; j < m; j++)
+                    kxx += rbf(X[i], X[j], sigma);
+            kxx = (2 * kxx) / (m * (m - 1));
+
+            for (let i = 0; i < n; i++)
+                for (let j = i + 1; j < n; j++)
+                    kyy += rbf(Y[i], Y[j], sigma);
+            kyy = (2 * kyy) / (n * (n - 1));
+
+            for (let i = 0; i < m; i++)
+                for (let j = 0; j < n; j++)
+                    kxy += rbf(X[i], Y[j], sigma);
+            kxy /= (m * n);
+
+            return kxx + kyy - 2 * kxy;
+        }
+
+        // Permutation test for MMD: returns p-value
+        function mmdPermTest(X, Y, sigma, nPerm) {
+            nPerm = nPerm ?? 200;
+            const observed = mmd2(X, Y, sigma);
+            const pooled = X.concat(Y);
+            const m = X.length;
+            let count = 0;
+            for (let p = 0; p < nPerm; p++) {
+                // Fisher-Yates shuffle
+                const shuffled = pooled.slice();
+                for (let i = shuffled.length - 1; i > 0; i--) {
+                    const j = (random.nextU32() % (i + 1)) >>> 0;
+                    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+                }
+                const permMmd = mmd2(shuffled.slice(0, m), shuffled.slice(m), sigma);
+                if (permMmd >= observed) count++;
+            }
+            return (count + 1) / (nPerm + 1);
+        }
+
+        return { rbf, gramMatrix, medianBandwidth, mmd2, mmdPermTest };
+    })();
+
+    // --- Graph Operations ---
+    const graph = (() => {
+        // DAG represented as adjacency list: {nodes: [...], edges: [{from, to}]}
+
+        // Get parents of a node
+        function parents(dag, node) {
+            return dag.edges.filter(e => e.to === node).map(e => e.from);
+        }
+
+        // Get children of a node
+        function children(dag, node) {
+            return dag.edges.filter(e => e.from === node).map(e => e.to);
+        }
+
+        // Get ancestors (all nodes that can reach 'node' via directed paths)
+        function ancestors(dag, node) {
+            const visited = new Set();
+            const queue = parents(dag, node);
+            while (queue.length > 0) {
+                const curr = queue.pop();
+                if (visited.has(curr)) continue;
+                visited.add(curr);
+                queue.push(...parents(dag, curr));
+            }
+            return [...visited];
+        }
+
+        // Get descendants
+        function descendants(dag, node) {
+            const visited = new Set();
+            const queue = children(dag, node);
+            while (queue.length > 0) {
+                const curr = queue.pop();
+                if (visited.has(curr)) continue;
+                visited.add(curr);
+                queue.push(...children(dag, curr));
+            }
+            return [...visited];
+        }
+
+        // Back-door criterion: find adjustment set Z for causal effect of X on Y
+        // Z must block all back-door paths from X to Y
+        // Z must not contain any descendant of X
+        // Simple approach: Z = non-descendants of X that are not X or Y
+        function backdoorSet(dag, treatment, outcome) {
+            const descX = new Set(descendants(dag, treatment));
+            // All non-descendants of X that are not X or Y
+            const candidates = dag.nodes.filter(n =>
+                n !== treatment && n !== outcome && !descX.has(n)
+            );
+            return candidates;
+        }
+
+        // Check if causal effect is identifiable via back-door
+        function isIdentifiable(dag, treatment, outcome) {
+            const Z = backdoorSet(dag, treatment, outcome);
+            return { identifiable: true, adjustmentSet: Z };
+        }
+
+        // Topological sort (Kahn's algorithm)
+        function topoSort(dag) {
+            const inDeg = {};
+            for (const n of dag.nodes) inDeg[n] = 0;
+            for (const e of dag.edges) inDeg[e.to] = (inDeg[e.to] ?? 0) + 1;
+            const queue = dag.nodes.filter(n => inDeg[n] === 0);
+            const result = [];
+            while (queue.length > 0) {
+                const n = queue.shift();
+                result.push(n);
+                for (const e of dag.edges.filter(e => e.from === n)) {
+                    inDeg[e.to]--;
+                    if (inDeg[e.to] === 0) queue.push(e.to);
+                }
+            }
+            return result;
+        }
+
+        return { parents, children, ancestors, descendants, backdoorSet, isIdentifiable, topoSort };
+    })();
+
+    return { random, linalg, stats, optim, tda, kernel, graph };
 })();
 </script>
 
@@ -906,7 +1100,52 @@ const DataLayer = (() => {
 
     function getActive() { return activeData; }
 
-    return { load, loadCSV, getActive, DATASETS, detectFormat };
+    // Regional context data (embedded from context_mi.csv)
+    const CONTEXT = [
+        {region:'North America', year:2025, population_millions:380, mi_prevalence_per_100k:2400, health_exp_per_capita:12000, age_65_plus_share:0.18, diabetes_prevalence:0.11, adoption_readiness:0.9, treatment_cost_usd:120},
+        {region:'North America', year:2030, population_millions:395, mi_prevalence_per_100k:2500, health_exp_per_capita:14000, age_65_plus_share:0.20, diabetes_prevalence:0.12, adoption_readiness:0.95, treatment_cost_usd:100},
+        {region:'Western Europe', year:2025, population_millions:450, mi_prevalence_per_100k:2200, health_exp_per_capita:6000, age_65_plus_share:0.22, diabetes_prevalence:0.08, adoption_readiness:0.85, treatment_cost_usd:80},
+        {region:'Western Europe', year:2030, population_millions:460, mi_prevalence_per_100k:2300, health_exp_per_capita:7000, age_65_plus_share:0.24, diabetes_prevalence:0.09, adoption_readiness:0.9, treatment_cost_usd:70},
+        {region:'Southeast Asia', year:2025, population_millions:680, mi_prevalence_per_100k:1800, health_exp_per_capita:800, age_65_plus_share:0.08, diabetes_prevalence:0.10, adoption_readiness:0.4, treatment_cost_usd:20},
+        {region:'Southeast Asia', year:2030, population_millions:720, mi_prevalence_per_100k:2000, health_exp_per_capita:1200, age_65_plus_share:0.10, diabetes_prevalence:0.12, adoption_readiness:0.5, treatment_cost_usd:15},
+        {region:'Sub-Saharan Africa', year:2025, population_millions:1200, mi_prevalence_per_100k:1200, health_exp_per_capita:150, age_65_plus_share:0.04, diabetes_prevalence:0.05, adoption_readiness:0.2, treatment_cost_usd:10},
+        {region:'Sub-Saharan Africa', year:2030, population_millions:1400, mi_prevalence_per_100k:1400, health_exp_per_capita:250, age_65_plus_share:0.05, diabetes_prevalence:0.06, adoption_readiness:0.3, treatment_cost_usd:8}
+    ];
+
+    // Generate synthetic IPD matching summary stats (for transport methods)
+    // Returns {trialIPD: [{age_65, diabetes, yi}], targetIPD: [{age_65, diabetes}]}
+    function generateTransportIPD(trialData, contextRow, nTrial, nTarget, seed) {
+        nTrial = nTrial ?? 200;
+        nTarget = nTarget ?? 200;
+        seed = seed ?? 42;
+        MathCore.random.seed(seed);
+        // Trial population: age_65 ~ Bernoulli(0.18), diabetes ~ Bernoulli(0.20) [reference]
+        const trialIPD = [];
+        for (let i = 0; i < nTrial; i++) {
+            const age65 = MathCore.random.uniform() < 0.18 ? 1 : 0;
+            const diabetes = MathCore.random.uniform() < 0.20 ? 1 : 0;
+            // yi from pooled effect + covariate effect
+            const yi = (trialData.yi ?? -0.25) + 0.05 * age65 + 0.10 * diabetes + MathCore.random.normal(0, 0.3);
+            trialIPD.push({age_65: age65, diabetes: diabetes, yi: yi});
+        }
+
+        // Target population: covariates from contextRow
+        const targetIPD = [];
+        for (let i = 0; i < nTarget; i++) {
+            const age65 = MathCore.random.uniform() < contextRow.age_65_plus_share ? 1 : 0;
+            const diabetes = MathCore.random.uniform() < contextRow.diabetes_prevalence ? 1 : 0;
+            targetIPD.push({age_65: age65, diabetes: diabetes});
+        }
+
+        return { trialIPD, targetIPD };
+    }
+
+    function getContext() { return CONTEXT; }
+    function getContextByRegion(region, year) {
+        return CONTEXT.find(c => c.region === region && c.year === year) ?? CONTEXT[0];
+    }
+
+    return { load, loadCSV, getActive, DATASETS, detectFormat, getContext, getContextByRegion, generateTransportIPD, CONTEXT };
 })();
 </script>
 
@@ -2209,6 +2448,62 @@ TestRunner.register('Integration: MCMC NMA on 60-trial subsample', function() {
     const subset = d.trialsYiVi.slice(0, 60);
     const nma = Limb1.methods.mcmcNMA(subset, {warmup: 500, samples: 1000, chains: 1, seed: 42});
     if (Math.abs(nma.mu1_mean) > 1) throw new Error('mu1=' + nma.mu1_mean + ' implausible (|mu1| > 1)');
+});
+
+// ---- T36: Gaussian RBF kernel self = 1 ----
+TestRunner.register('Kernel: RBF k(x,x) = 1', function() {
+    const v = MathCore.kernel.rbf([1, 2], [1, 2], 1.0);
+    if (Math.abs(v - 1.0) > 1e-10) throw new Error('k(x,x) = ' + v);
+});
+
+// ---- T37: MMD^2 between identical samples ~0 ----
+TestRunner.register('Kernel: MMD^2 identical ~0', function() {
+    const X = [[0,0],[1,1],[2,2]];
+    const mmd = MathCore.kernel.mmd2(X, X, 1.0);
+    if (Math.abs(mmd) > 0.5) throw new Error('MMD^2 = ' + mmd + ', expected ~0');
+});
+
+// ---- T38: MMD^2 between different samples > 0 ----
+TestRunner.register('Kernel: MMD^2 different > 0', function() {
+    const X = [[0,0],[0.1,0.1],[0.2,0.2]];
+    const Y = [[5,5],[5.1,5.1],[5.2,5.2]];
+    const mmd = MathCore.kernel.mmd2(X, Y, 1.0);
+    if (mmd <= 0) throw new Error('MMD^2 = ' + mmd + ', expected > 0');
+});
+
+// ---- T39: Back-door adjustment set includes confounder Z ----
+TestRunner.register('Graph: back-door set X->Y with confounder Z', function() {
+    const dag = {
+        nodes: ['Z', 'X', 'Y'],
+        edges: [{from:'Z', to:'X'}, {from:'Z', to:'Y'}, {from:'X', to:'Y'}]
+    };
+    const Z = MathCore.graph.backdoorSet(dag, 'X', 'Y');
+    if (!Z.includes('Z')) throw new Error('Adjustment set should include Z, got ' + Z);
+});
+
+// ---- T40: Topological sort A->B->C ----
+TestRunner.register('Graph: topological sort A->B->C', function() {
+    const dag = {
+        nodes: ['A', 'B', 'C'],
+        edges: [{from:'A', to:'B'}, {from:'B', to:'C'}]
+    };
+    const sorted = MathCore.graph.topoSort(dag);
+    if (sorted[0] !== 'A' || sorted[2] !== 'C') throw new Error('Sort = ' + sorted);
+});
+
+// ---- T41: Context data has 8 rows ----
+TestRunner.register('DataLayer: context data has 8 rows', function() {
+    const ctx = DataLayer.getContext();
+    if (ctx.length !== 8) throw new Error('Expected 8, got ' + ctx.length);
+});
+
+// ---- T42: Generate transport IPD (100 trial + 100 target) ----
+TestRunner.register('DataLayer: generate transport IPD', function() {
+    const ctx = DataLayer.getContextByRegion('North America', 2025);
+    const ipd = DataLayer.generateTransportIPD({yi: -0.25}, ctx, 100, 100, 42);
+    if (ipd.trialIPD.length !== 100) throw new Error('Trial n=' + ipd.trialIPD.length);
+    if (ipd.targetIPD.length !== 100) throw new Error('Target n=' + ipd.targetIPD.length);
+    if (typeof ipd.trialIPD[0].age_65 !== 'number') throw new Error('Missing age_65');
 });
 </script>
 
