@@ -1,8 +1,9 @@
 // Full test runner - runs all registered tests via TestRunner
 const fs = require('fs');
+const path = require('path');
 const vm = require('vm');
 
-const content = fs.readFileSync('C:/Users/user/four_limb_synthesis/index.html', 'utf8');
+const content = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 
 const scriptBlocks = [];
 const regex = /<script[^>]*>([\s\S]*?)<\/script>/gi;

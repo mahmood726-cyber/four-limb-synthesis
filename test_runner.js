@@ -2,9 +2,10 @@
 // Extracts and runs all script blocks from index.html
 
 const fs = require('fs');
+const path = require('path');
 const vm = require('vm');
 
-const content = fs.readFileSync('C:/Users/user/four_limb_synthesis/index.html', 'utf8');
+const content = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 
 // Extract all script blocks
 const scriptBlocks = [];
