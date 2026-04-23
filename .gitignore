@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+data_raw/ctgov_massive_drift.csv
+data_raw/ctgov_quantum_network.csv
+outputs/
+data_processed/
+.claude/
+*.egg-info/
